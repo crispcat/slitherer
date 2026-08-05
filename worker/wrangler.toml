@@ -1,0 +1,27 @@
+name = "slitherer-rag"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+EMBEDDING_MODEL = "@cf/baai/bge-m3"
+EMBEDDING_DIMENSIONS = "1024"
+EXTRACTION_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast"
+ANSWER_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+RERANK_MODEL = "@cf/baai/bge-reranker-base"
+
+[ai]
+binding = "AI"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "slitherer-rag-db"
+database_id = "acca8b79-5e74-4fc4-b174-d98c650f1494"
+
+[[vectorize]]
+binding = "VECTORIZE_INDEX"
+index_name = "slitherer-rag-units"
+
+[[r2_buckets]]
+bucket_name = "slitherer-rag-storage"
+binding = "slitherer_rag_storage"

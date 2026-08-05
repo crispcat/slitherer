@@ -1,0 +1,4 @@
+# Copy to .dev.vars (gitignored) for local `wrangler dev`.
+ADMIN_API_KEY=devsecret
+# Optional — if unset, /query stays open with no auth.
+# QUERY_API_KEY=devsecret
