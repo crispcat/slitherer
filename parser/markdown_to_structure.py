@@ -59,7 +59,13 @@ class IdCounter:
         return f"{node_type.upper()}-{self._counts[node_type]:05d}"
 
 
-NUMBERED_RULE_RE = re.compile(r"^\s*\d+(\.\d+)*\.?\s+\S")
+NUMBERED_RULE_RE = re.compile(r"^\s*\d+(\.\d+)*[\.\)]\s+\S")
+
+# Split structural leaf nodes if they grow too large, so downstream semantic
+# unit detection stays within a reasonable verbatim-extraction budget.
+MAX_TABLE_ROWS = 30
+MAX_TABLE_CHARS = 4000
+MAX_RULE_CHARS = 4000
 
 
 def parse(markdown_text: str) -> dict:
@@ -78,24 +84,72 @@ def parse(markdown_text: str) -> dict:
     def parent_of_new_block() -> str:
         return heading_stack[-1][1]
 
+    def is_separator_row(line: str) -> bool:
+        """A Markdown table separator row only contains dashes/colons/whitespace."""
+        cells = [cell.strip() for cell in line.split("|")]
+        cells = [cell for cell in cells if cell]
+        if not cells:
+            return False
+        return all(re.fullmatch(r"^[-:\s]+$", cell) for cell in cells)
+
+    def is_data_table(lines: list[str]) -> bool:
+        """True if the table has a header separator row (|---|---|...)."""
+        return any(is_separator_row(line) for line in lines)
+
     def flush_table():
         nonlocal pending_table_lines, current_leaf_id
         if not pending_table_lines:
             return
-        table_id = ids.next("table")
         parent_id = parent_of_new_block()
-        node = Node(
-            id=table_id,
-            type="table",
-            parent=parent_id,
-            page=current_page,
-            path=list(path_titles),
-            content="\n".join(pending_table_lines),
-        )
-        nodes[table_id] = node
-        nodes[parent_id].children.append(table_id)
+
+        if is_data_table(pending_table_lines):
+            # Real data table: keep as one (or split) table node(s).
+            table_id = ids.next("table")
+            node = Node(
+                id=table_id,
+                type="table",
+                parent=parent_id,
+                page=current_page,
+                path=list(path_titles),
+                content="\n".join(pending_table_lines),
+            )
+            nodes[table_id] = node
+            nodes[parent_id].children.append(table_id)
+        else:
+            # Decorative grid (e.g. skills laid out in a table with no header):
+            # each non-empty cell becomes its own rule leaf so semantic detection
+            # treats every skill/perk as an independent unit.
+            for line in pending_table_lines:
+                cells = [cell.strip() for cell in line.split("|")]
+                for cell in cells:
+                    if not cell:
+                        continue
+                    rule_id = ids.next("rule")
+                    node = Node(
+                        id=rule_id,
+                        type="rule",
+                        parent=parent_id,
+                        page=current_page,
+                        path=list(path_titles),
+                        content=cell,
+                    )
+                    nodes[rule_id] = node
+                    nodes[parent_id].children.append(rule_id)
+
         pending_table_lines = []
         current_leaf_id = None
+
+    def maybe_split_table():
+        nonlocal pending_table_lines
+        if not pending_table_lines:
+            return
+        # Only split real data tables; decorative grids are better handled as
+        # one cell-per-rule emission once the block is flushed.
+        if is_data_table(pending_table_lines) and (
+            len(pending_table_lines) >= MAX_TABLE_ROWS
+            or sum(len(line) for line in pending_table_lines) >= MAX_TABLE_CHARS
+        ):
+            flush_table()
 
     path_titles: list[str] = []
 
@@ -110,6 +164,7 @@ def parse(markdown_text: str) -> dict:
             continue
 
         if TABLE_ROW_RE.match(line.strip()):
+            maybe_split_table()
             pending_table_lines.append(line.strip())
             continue
         else:
@@ -153,6 +208,11 @@ def parse(markdown_text: str) -> dict:
         parent_id = parent_of_new_block()
         note = text.lower().startswith(("примечание", "note:", "внимание"))
         is_rule_start = bool(NUMBERED_RULE_RE.match(text)) or text.startswith("- ")
+
+        # If the current rule leaf has grown too large, force a new leaf so that
+        # downstream semantic detection can work with reasonably sized chunks.
+        if current_leaf_id is not None and len(nodes[current_leaf_id].content) >= MAX_RULE_CHARS:
+            current_leaf_id = None
 
         if current_leaf_id is None or is_rule_start:
             node_type = "note" if note else "rule"
