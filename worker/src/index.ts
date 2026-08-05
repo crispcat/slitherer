@@ -1,6 +1,6 @@
 import type { Env, StructureDocument } from "./types";
 import { processIngestionBatch, rebuildAllRelationships, startIngestion } from "./pipeline/ingest";
-import { cleanupDocument, getIngestionJob } from "./utils/db";
+import { cleanupDocument, getIngestionJob, getUnitsWithUnresolvedRefs } from "./utils/db";
 import { retrieve } from "./retrieval/query";
 import { generateAnswer } from "./retrieval/answer";
 import { uuid } from "./utils/ids";
@@ -125,6 +125,26 @@ export default {
         const job = await getIngestionJob(env, jobId);
         if (!job) return json({ error: "not found" }, 404);
         return json(job);
+      }
+
+      // GET /ingest/orphans?documentId=...
+      // Returns units with unresolved metadata references, useful for QA review.
+      if (url.pathname === "/ingest/orphans" && request.method === "GET") {
+        const documentId = url.searchParams.get("documentId") ?? "";
+        if (!documentId) return json({ error: "documentId is required" }, 400);
+        const units = await getUnitsWithUnresolvedRefs(env, documentId);
+        return json({
+          documentId,
+          count: units.length,
+          units: units.map((u) => ({
+            id: u.id,
+            type: u.type,
+            name: u.name,
+            section: u.section,
+            page: u.page,
+            unresolved: u.metadata?.unresolved_references ?? [],
+          })),
+        });
       }
 
       // POST /ingest/cleanup { documentId }

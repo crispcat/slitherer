@@ -56,6 +56,7 @@ export interface SemanticUnit {
   id: string;
   sourceNodeId: string;
   parentUnitId: string | null;
+  sourceOrder?: number; // position within the source structure node (for adjacency relations)
   type: SemanticUnitType;
   name: string | null;
   page: number;
@@ -80,6 +81,9 @@ export interface UnitMetadata {
   keywords: string[];
   aliases: string[];
   summary: string;
+  /** Reference-like strings extracted from metadata that could not be resolved
+   *  to any candidate unit. Stored for downstream reporting and iterative cleanup. */
+  unresolved_references?: string[];
 }
 
 // ---- Phase 5: relationships ----

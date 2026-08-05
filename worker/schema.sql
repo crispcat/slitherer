@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS semantic_units (
   summary TEXT,
   metadata_json TEXT,          -- raw Phase 4 extraction output (defines/references/requires/exceptions/modifies/modified_by/keywords/aliases)
   parent_unit_id TEXT,         -- set when this unit was split out of another unit
+  source_order INTEGER,      -- position of this unit within its source structure node (for adjacency relations)
   embedding_id TEXT,           -- Vectorize vector id
   status TEXT NOT NULL DEFAULT 'pending', -- pending -> metadata_done -> relations_done -> embedded -> graphed
   updated_at TEXT NOT NULL,

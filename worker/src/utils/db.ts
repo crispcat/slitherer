@@ -28,8 +28,8 @@ export async function upsertStructureNode(env: Env, documentId: string, node: St
 export async function upsertSemanticUnit(env: Env, u: SemanticUnit) {
   await env.DB.prepare(
     `INSERT INTO semantic_units
-       (id, source_node_id, type, name, page, section, content, content_hash, summary, metadata_json, parent_unit_id, embedding_id, status, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (id, source_node_id, type, name, page, section, content, content_hash, summary, metadata_json, parent_unit_id, source_order, embedding_id, status, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        source_node_id = excluded.source_node_id,
        type = excluded.type,
@@ -41,6 +41,7 @@ export async function upsertSemanticUnit(env: Env, u: SemanticUnit) {
        summary = excluded.summary,
        metadata_json = excluded.metadata_json,
        parent_unit_id = excluded.parent_unit_id,
+       source_order = excluded.source_order,
        embedding_id = excluded.embedding_id,
        status = excluded.status,
        updated_at = excluded.updated_at`
@@ -56,7 +57,8 @@ export async function upsertSemanticUnit(env: Env, u: SemanticUnit) {
       u.contentHash,
       u.summary ?? null,
       u.metadata ? JSON.stringify(u.metadata) : null,
-      u.parentUnitId,
+      u.parentUnitId ?? null,
+      u.sourceOrder ?? null,
       u.embeddingId ?? null,
       u.status,
       u.updatedAt
@@ -91,6 +93,7 @@ function rowToUnit(row: any): SemanticUnit {
     id: row.id,
     sourceNodeId: row.source_node_id,
     parentUnitId: row.parent_unit_id,
+    sourceOrder: row.source_order ?? undefined,
     type: row.type,
     name: row.name,
     page: row.page,
@@ -165,10 +168,42 @@ export async function getRelationsForUnits(env: Env, unitIds: string[]): Promise
 
 export async function findCandidateUnits(env: Env, unit: SemanticUnit, limit = 20): Promise<SemanticUnit[]> {
   const keywords = unit.metadata?.keywords ?? [];
-  const chapter = unit.section[0] ?? "";
+  // Collect explicit reference strings from metadata to use as search probes.
+  const referenceNames = new Set<string>();
+  const addRefs = (arr?: string[]) => {
+    if (!arr) return;
+    for (const s of arr) {
+      const trimmed = s.trim();
+      if (trimmed.length > 0) referenceNames.add(trimmed);
+    }
+  };
+  addRefs(unit.metadata?.defines);
+  addRefs(unit.metadata?.references);
+  addRefs(unit.metadata?.requires);
+  addRefs(unit.metadata?.modifies);
+  addRefs(unit.metadata?.modified_by);
+  addRefs(unit.metadata?.exceptions);
+  addRefs(unit.metadata?.aliases);
 
-  let rows: any[] = [];
-  if (keywords.length > 0) {
+  // Prefer the most specific non-empty section path element (e.g. the subsection).
+  const sectionPath = unit.section.filter((s) => s?.trim().length > 0);
+  const deepestSection = sectionPath[sectionPath.length - 1] ?? "";
+  const chapter = sectionPath[0] ?? "";
+
+  const seen = new Set<string>();
+  const rows: any[] = [];
+  const addRows = (results: any[] | undefined | null) => {
+    for (const r of results ?? []) {
+      const id = (r as any).id as string;
+      if (id !== unit.id && !seen.has(id)) {
+        seen.add(id);
+        rows.push(r);
+      }
+    }
+  };
+
+  // 1. Keyword-based candidates.
+  if (keywords.length > 0 && rows.length < limit) {
     const placeholders = keywords.map(() => "?").join(",");
     const { results } = await env.DB.prepare(
       `SELECT DISTINCT su.* FROM semantic_units su
@@ -178,18 +213,55 @@ export async function findCandidateUnits(env: Env, unit: SemanticUnit, limit = 2
     )
       .bind(...keywords, unit.id, limit)
       .all();
-    rows = results ?? [];
+    addRows(results);
   }
 
+  // 2. Reference-name candidates (name, defines, content, summary, section).
+  if (referenceNames.size > 0 && rows.length < limit) {
+    const names = Array.from(referenceNames).filter((n) => n.length > 1);
+    if (names.length > 0) {
+      const placeholders = names.map(() => "?").join(",");
+      const likeClauses = names.map(() => "metadata_json LIKE ? OR content LIKE ? OR summary LIKE ?").join(" OR ");
+      const { results } = await env.DB.prepare(
+        `SELECT * FROM semantic_units
+         WHERE id != ? AND (
+           name IN (${placeholders}) OR ${likeClauses}
+         )
+         LIMIT ?`
+      )
+        .bind(
+          unit.id,
+          ...names,
+          ...names.flatMap((n) => [`%${n}%`, `%${n}%`, `%${n}%`])
+        )
+        .all();
+      addRows(results);
+    }
+  }
+
+  // 3. Same-source-node siblings: units from the same structure node are
+  // likely related even when the split lost adjacency (e.g. an age modifier
+  // and the "Старый" label it follows).
   if (rows.length < limit) {
     const { results } = await env.DB.prepare(
-      `SELECT * FROM semantic_units WHERE section LIKE ? AND id != ? LIMIT ?`
+      `SELECT * FROM semantic_units WHERE source_node_id = ? AND id != ? LIMIT ?`
     )
-      .bind(`%${chapter}%`, unit.id, limit - rows.length)
+      .bind(unit.sourceNodeId, unit.id, limit - rows.length)
       .all();
-    const seen = new Set(rows.map((r: any) => r.id));
-    for (const r of results ?? []) {
-      if (!seen.has((r as any).id)) rows.push(r);
+    addRows(results);
+  }
+
+  // 4. Section-path candidates: deepest first, then chapter as fallback.
+  if (rows.length < limit) {
+    for (const sectionPattern of [deepestSection, chapter]) {
+      if (rows.length >= limit) break;
+      if (!sectionPattern) continue;
+      const { results } = await env.DB.prepare(
+        `SELECT * FROM semantic_units WHERE section LIKE ? AND id != ? LIMIT ?`
+      )
+        .bind(`%${sectionPattern}%`, unit.id, limit - rows.length)
+        .all();
+      addRows(results);
     }
   }
 
@@ -198,6 +270,19 @@ export async function findCandidateUnits(env: Env, unit: SemanticUnit, limit = 2
 
 export async function getAllUnits(env: Env): Promise<SemanticUnit[]> {
   const { results } = await env.DB.prepare(`SELECT * FROM semantic_units`).all();
+  return (results ?? []).map(rowToUnit);
+}
+
+/** Return units whose metadata contains unresolved references for a document.
+ *  Useful for a human-in-the-loop review pass after ingestion. */
+export async function getUnitsWithUnresolvedRefs(env: Env, documentId: string): Promise<SemanticUnit[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT su.* FROM semantic_units su
+     JOIN structure_nodes sn ON su.source_node_id = sn.id
+     WHERE sn.document_id = ? AND su.metadata_json LIKE '%unresolved_references%'`
+  )
+    .bind(documentId)
+    .all();
   return (results ?? []).map(rowToUnit);
 }
 
