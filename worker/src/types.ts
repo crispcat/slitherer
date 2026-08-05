@@ -56,7 +56,7 @@ export interface SemanticUnit {
   id: string;
   sourceNodeId: string;
   parentUnitId: string | null;
-  sourceOrder?: number; // position within the source structure node (for adjacency relations)
+  sourceOrder: number; // position within the source structure node (for adjacency relations)
   type: SemanticUnitType;
   name: string | null;
   page: number;
@@ -101,6 +101,7 @@ export const RELATION_TYPES = [
   "consumes",
   "supersedes",
   "example_of",
+  "part_of",
 ] as const;
 export type RelationType = (typeof RELATION_TYPES)[number];
 

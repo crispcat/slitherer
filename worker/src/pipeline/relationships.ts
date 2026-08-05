@@ -82,10 +82,10 @@ function resolveReference(name: string, candidates: SemanticUnit[]): SemanticUni
 
 /** Build deterministic adjacency relations for units split from the same source node. */
 function extractAdjacencyRelations(unit: SemanticUnit, candidates: SemanticUnit[]): Relation[] {
-  const siblings = candidates.filter((c) => c.sourceNodeId === unit.sourceNodeId && c.sourceOrder != null);
+  const siblings = candidates.filter((c) => c.sourceNodeId === unit.sourceNodeId);
   if (siblings.length <= 1) return [];
 
-  siblings.sort((a, b) => (a.sourceOrder ?? 0) - (b.sourceOrder ?? 0));
+  siblings.sort((a, b) => a.sourceOrder - b.sourceOrder);
   const index = siblings.findIndex((c) => c.id === unit.id);
   if (index === -1) return [];
 
@@ -105,6 +105,22 @@ function extractAdjacencyRelations(unit: SemanticUnit, candidates: SemanticUnit[
   if (index < siblings.length - 1) addEdge(siblings[index + 1]);
 
   return relations;
+}
+
+/** Build a parent-child relation for units the LLM chose to keep linked rather than merged. */
+function extractParentRelations(unit: SemanticUnit, candidates: SemanticUnit[]): Relation[] {
+  if (!unit.parentUnitId) return [];
+  const parent = candidates.find((c) => c.id === unit.parentUnitId);
+  if (!parent) return [];
+  return [
+    {
+      id: nextId("REL"),
+      source: unit.id,
+      target: parent.id,
+      relation_type: "part_of",
+      confidence: 0.95,
+    },
+  ];
 }
 
 interface MetadataRelationResult {
@@ -204,12 +220,13 @@ export async function extractRelationships(
   candidates: SemanticUnit[]
 ): Promise<Relation[]> {
   const adjacencyRelations = extractAdjacencyRelations(unit, candidates);
+  const parentRelations = extractParentRelations(unit, candidates);
   const { relations: metadataRelations, unresolved } = extractMetadataRelations(unit, candidates);
   const llmRelations = await extractLLMRelations(env, unit, candidates);
 
   const seen = new Set<string>();
   const relations: Relation[] = [];
-  for (const r of [...adjacencyRelations, ...metadataRelations, ...llmRelations]) {
+  for (const r of [...adjacencyRelations, ...parentRelations, ...metadataRelations, ...llmRelations]) {
     const key = `${r.source}|${r.target}|${r.relation_type}`;
     if (seen.has(key)) continue;
     seen.add(key);

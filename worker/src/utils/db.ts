@@ -93,7 +93,7 @@ function rowToUnit(row: any): SemanticUnit {
     id: row.id,
     sourceNodeId: row.source_node_id,
     parentUnitId: row.parent_unit_id,
-    sourceOrder: row.source_order ?? undefined,
+    sourceOrder: row.source_order ?? 0,
     type: row.type,
     name: row.name,
     page: row.page,
@@ -244,7 +244,7 @@ export async function findCandidateUnits(env: Env, unit: SemanticUnit, limit = 2
   // and the "Старый" label it follows).
   if (rows.length < limit) {
     const { results } = await env.DB.prepare(
-      `SELECT * FROM semantic_units WHERE source_node_id = ? AND id != ? LIMIT ?`
+      `SELECT * FROM semantic_units WHERE source_node_id = ? AND id != ? ORDER BY source_order LIMIT ?`
     )
       .bind(unit.sourceNodeId, unit.id, limit - rows.length)
       .all();
