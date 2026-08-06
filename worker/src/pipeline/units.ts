@@ -56,10 +56,34 @@ function getFirstTableCell(row: string): string {
   return match ? match[1].trim() : line.split("|")[0]?.trim() ?? "";
 }
 
-/** Split a Markdown table into row chunks, pre-grouping visually-continued rows. */
+/** Check if all cells in a table row are identical (merged-cell artifact). */
+function isMergedRow(line: string): boolean {
+  const cells = line.split("|").slice(1, -1).map((c) => c.trim());
+  if (cells.length < 2) return false;
+  const first = cells[0];
+  if (!first) return false;
+  return cells.every((c) => c === first);
+}
+
+/** Collapse a merged-cell row (all cells identical) to a single-cell row. */
+function collapseMergedRow(line: string): string {
+  const cells = line.split("|").slice(1, -1).map((c) => c.trim());
+  const first = cells[0];
+  return `| ${first} |`;
+}
+
+/** Split a Markdown table into row chunks, pre-grouping visually-continued rows.
+ *  Merged-cell rows (all cells identical) are collapsed to single-cell rows. */
 function chunkTableContent(source: string): Chunk[] {
-  const lines = source.split("\n");
-  if (lines.length === 0) return [];
+  const rawLines = source.split("\n");
+  if (rawLines.length === 0) return [];
+
+  // Collapse merged-cell rows (all cells identical) to single-cell rows.
+  // Build a new source string from the collapsed lines so positions are consistent.
+  const lines = rawLines.map((l) =>
+    l.includes("|") && isMergedRow(l) ? collapseMergedRow(l) : l
+  );
+  const collapsedSource = lines.join("\n");
 
   const lineStarts: number[] = [];
   let pos = 0;
@@ -93,7 +117,7 @@ function chunkTableContent(source: string): Chunk[] {
     if (!isData) {
       if (inGroup) {
         chunks.push({
-          content: source.slice(lineStarts[groupStart], lineStarts[groupEnd] + lines[groupEnd].length),
+          content: collapsedSource.slice(lineStarts[groupStart], lineStarts[groupEnd] + lines[groupEnd].length),
           start: lineStarts[groupStart],
         });
         inGroup = false;
@@ -109,7 +133,7 @@ function chunkTableContent(source: string): Chunk[] {
     } else {
       if (inGroup) {
         chunks.push({
-          content: source.slice(lineStarts[groupStart], lineStarts[groupEnd] + lines[groupEnd].length),
+          content: collapsedSource.slice(lineStarts[groupStart], lineStarts[groupEnd] + lines[groupEnd].length),
           start: lineStarts[groupStart],
         });
       }
@@ -122,7 +146,7 @@ function chunkTableContent(source: string): Chunk[] {
 
   if (inGroup) {
     chunks.push({
-      content: source.slice(lineStarts[groupStart], lineStarts[groupEnd] + lines[groupEnd].length),
+      content: collapsedSource.slice(lineStarts[groupStart], lineStarts[groupEnd] + lines[groupEnd].length),
       start: lineStarts[groupStart],
     });
   }
@@ -165,8 +189,13 @@ function parseTableLine(line: string, lineIndex: number, lineStart: number): Par
  *  column becomes one cell. Cell content is normalised to "| text |" to keep
  *  headers and data uniform. */
 function chunkTableCells(source: string): Chunk[][] {
-  const lines = source.split("\n");
-  if (lines.length === 0) return [];
+  const rawLines = source.split("\n");
+  if (rawLines.length === 0) return [];
+
+  // Collapse merged-cell rows (all cells identical) to single-cell rows.
+  const lines = rawLines.map((l) =>
+    l.includes("|") && isMergedRow(l) ? collapseMergedRow(l) : l
+  );
 
   const lineStarts: number[] = [];
   let pos = 0;
@@ -225,8 +254,10 @@ function chunkTableCells(source: string): Chunk[][] {
 }
 
 interface TableMode {
-  mode: "cell" | "row" | "table" | "split_2col";
+  mode: "cell" | "row" | "table" | "split_2col" | "split_3col" | "split_4col";
   link_target: "row" | "column" | "none";
+  has_description_row: boolean;
+  section_headers: string[];
   reason: string;
 }
 
@@ -235,33 +266,48 @@ const TABLE_MODE_SCHEMA: Record<string, unknown> = {
   properties: {
     mode: { type: "string" },
     link_target: { type: "string" },
+    has_description_row: { type: "boolean" },
+    section_headers: { type: "array", items: { type: "string" } },
     reason: { type: "string" },
   },
-  required: ["mode", "link_target", "reason"],
+  required: ["mode", "link_target", "has_description_row", "section_headers", "reason"],
 };
 
 const TABLE_LAYOUT_PROMPT_2COL = `You are a semantic-layout analyzer for a Russian tabletop RPG rulebook.
 
 Given the 2-column Markdown table below, decide how to split it into search/retrieval units.
 
+MERGED ROWS (rows where all cells contain the same text):
+- A merged row at the START of the table (before the header) is a "description row" — it describes the table's subject. Set has_description_row to true.
+- A merged row in the MIDDLE of the table can be a "section header" — it starts a new category, and all subsequent data rows/cells belong to this category instead of the original column headers. List the text content of such rows in section_headers.
+- A merged row can also be just a wide data entry (a single piece of content spanning all columns). Do NOT list these in section_headers — they are just data.
+
+How to tell section headers from wide data entries:
+- A section header is a short CATEGORY LABEL (e.g. "Магические навыки", "Дополнительное оборудование"). After it, the data rows change topic.
+- A wide data entry is a longer piece of CONTENT that stands on its own (e.g. a rule description, a paragraph). It doesn't change the topic of subsequent rows.
+
 - "cell" — each non-header cell is its own unit, linked to its column header.
-  Use this when the left and right columns are two INDEPENDENT lists. Examples:
-  • "Disadvantages | Advantages" — each cell is a standalone trait
-  • "Name | Description" — each cell is a standalone entry
-  • Two columns of unrelated rules grouped only by type
+  Use this ONLY when the left and right columns are two INDEPENDENT lists of the same kind of thing. Examples:
+  • "Disadvantages | Advantages" — each cell is a standalone trait, the two columns are different categories
+  • "Copper perks | Silver perks" — each cell is a standalone perk, the columns are different tiers
+  The key test: could you swap a left-cell with a right-cell and it would still make sense? If yes, use "cell".
 
 - "row" — each logical data row is one unit.
-  Use this when both columns together form one entity. Examples:
-  • "Value | Meaning" — both cells describe one thing
-  • "Item | Price" — the row is one item with its price
+  Use this when both columns together form one entity — a key-value pair, a lookup, or a description. Examples:
+  • "Value | Meaning" — the value and its meaning are one entity
+  • "Рз | Эффект" — the attribute level and its effect are one entity
+  • "Item | Price" — the item and its price are one entity
+  • "Н 0 | Полное незнание." — the skill level and its description are one entity
+  The key test: does the left column IDENTIFY what the right column describes? If yes, use "row".
 
 - "table" — the whole table is a single unit.
-  Use this only when the table is a visual layout device (e.g. a paragraph split into columns).
+  Use this VERY RARELY, only when the table has NO meaningful rows at all — e.g. a single paragraph of text split into columns for visual reasons, or a table with only one data row. If the table has multiple data rows with different content, do NOT use "table" — use "row" or "cell" instead.
 
 Return ONLY a JSON object:
-{"mode": "cell" | "row" | "table", "link_target": "column" | "row" | "none", "reason": "short explanation in English"}
+{"mode": "cell" | "row" | "table", "link_target": "column" | "row" | "none", "has_description_row": true | false, "section_headers": ["text of section header rows"], "reason": "short explanation in English"}
 
 For "cell" mode, use link_target "column". For "row" mode, use link_target "none". For "table" mode, use link_target "none".
+section_headers should contain the exact text content (without | markers) of each merged row that is a section header. Empty array if none.
 
 Table:
 {{TABLE_CONTENT}}
@@ -273,19 +319,39 @@ const TABLE_LAYOUT_PROMPT_EVEN = `You are a semantic-layout analyzer for a Russi
 Given the Markdown table below (which has an even number of columns ≥ 4), decide if it is:
 1. A true multi-column table where all columns together describe one entity per row → choose "row"
 2. Two or more 2-column sub-tables placed side-by-side for compactness → choose "split_2col"
+3. Three or more 3-column sub-tables placed side-by-side → choose "split_3col"
+4. Four or more 4-column sub-tables placed side-by-side → choose "split_4col"
 
-Examples of "split_2col":
-| Значение 1 | Слабый | Значение 4 | Выдающийся |     → two 2-col tables: [Значение 1 | Слабый] and [Значение 4 | Выдающийся]
-| Н 0 | Полное незнание. | Н 60 | Профессионал. |       → two 2-col tables: [Н 0 | Полное незнание.] and [Н 60 | Профессионал.]
+MERGED ROWS (rows where all cells contain the same text):
+- A merged row at the START of the table (before the header) is a "description row" — it describes the table's subject. Set has_description_row to true.
+- A merged row in the MIDDLE of the table can be a "section header" — it starts a new category, and all subsequent data rows belong to this category. List the text content of such rows in section_headers.
+- A merged row can also be just a wide data entry. Do NOT list these in section_headers.
 
-Examples of "row" (NOT split_2col):
-| Сл | Оружие | Вес | Могучий Удар |              → all 4 columns are different properties of one row
-| Форма | Первая форма | Вторая форма | Третья форма | → label + 3 values, one entity per row
+How to tell section headers from wide data entries:
+- A section header is a short CATEGORY LABEL (e.g. "СВОЙСТВА ОРУЖИЯ", "Дополнительное оборудование"). After it, the data rows change topic.
+- A wide data entry is a longer piece of CONTENT that stands on its own. It doesn't change the topic of subsequent rows.
 
-Key distinction: in "split_2col", columns 1&2 form one logical pair and columns 3&4 form another. In "row", all columns are different aspects of the same entity.
+How to distinguish split modes from "row":
+- Look at the column HEADERS (the row after --- separators, or the first data row).
+- In "split_2col", columns 1&2 repeat the SAME PATTERN as columns 3&4. Both pairs are key-value lookups with the SAME semantic meaning.
+  Example: "Н 0 | Полное незнание. | Н 60 | Профессионал." — columns 1&2 are [skill level | description], columns 3&4 are ALSO [skill level | description]. Same meaning → split_2col.
+- In "row", all columns are DIFFERENT properties of one entity.
+  Example: "Сл | Оружие | Переноси-мый вес | Могучий Удар" — each column is a different property (strength level, weapon ability, weight, combat ability). Different properties → row.
+
+CRITICAL: Do NOT confuse "row" with "split_2col" just because both pairs have [number | text] format.
+- "Сл | Оружие | Вес | Могучий Удар" is "row" because: col 1 = skill level, col 3 = weight number. These are DIFFERENT types of numbers with different meanings.
+- "Н 0 | Описание | Н 60 | Описание" is "split_2col" because: col 1 and col 3 are BOTH skill levels with the same meaning.
+
+The test: do columns 1 and 3 (or 1 and 4 for split_3col) represent the SAME type of value with the SAME meaning? If they represent different properties (even if both are numeric), it's "row".
+
+Strong signal for split modes: the same TYPE of value repeats in columns 1, 3 (for split_2col), or 1, 4 (for split_3col), etc., AND the column headers repeat the same labels or synonyms.
+
+Only choose split_3col if the total column count is divisible by 3. Only choose split_4col if divisible by 4. Otherwise choose split_2col (requires divisible by 2) or "row".
 
 Return ONLY a JSON object:
-{"mode": "row" | "split_2col", "link_target": "none", "reason": "short explanation in English"}
+{"mode": "row" | "split_2col" | "split_3col" | "split_4col", "link_target": "none", "has_description_row": true | false, "section_headers": ["text of section header rows"], "reason": "short explanation in English"}
+
+section_headers should contain the exact text content (without | markers) of each merged row that is a section header. Empty array if none.
 
 Table:
 {{TABLE_CONTENT}}
@@ -294,9 +360,19 @@ Return JSON:`;
 
 async function detectTableMode(env: Env, node: StructureNode): Promise<TableMode> {
   const lines = node.content.split("\n");
-  const headerIdx = lines.findIndex((l) => l.includes("|") && !/^[\|\s]*[-:]+/.test(l));
-  const headerLine = headerIdx >= 0 ? lines[headerIdx] : lines[0];
-  const colCount = Math.max(0, (headerLine.match(/\|/g) || []).length - 1);
+
+  // Compute column count from the row with the most columns, not just the
+  // first row. This handles tables where the first row is a merged-cell
+  // description (all cells identical) that would otherwise undercount.
+  let colCount = 0;
+  for (const l of lines) {
+    if (!l.includes("|")) continue;
+    if (/^[\|\s]*[-:]+/.test(l)) continue; // separator
+    const cells = l.split("|").slice(1, -1).map((c) => c.trim());
+    // Skip merged rows (all cells identical) — they don't reflect true width.
+    if (cells.length >= 2 && cells.every((c) => c === cells[0]) && cells[0]) continue;
+    colCount = Math.max(colCount, cells.length);
+  }
 
   // 2-column tables: LLM decides cell vs row vs table.
   if (colCount === 2) {
@@ -306,45 +382,99 @@ async function detectTableMode(env: Env, node: StructureNode): Promise<TableMode
         env,
         prompt,
         "Return the JSON object with the table layout decision.",
-        { model: env.EXTRACTION_MODEL, maxRetries: 1, schema: TABLE_MODE_SCHEMA }
+        { model: env.ANSWER_MODEL, maxRetries: 1, schema: TABLE_MODE_SCHEMA }
       );
 
-      const mode = raw?.mode === "cell" || raw?.mode === "row" || raw?.mode === "table" ? raw.mode : "row";
+      let mode = raw?.mode === "cell" || raw?.mode === "row" || raw?.mode === "table" ? raw.mode : "row";
+      let has_description_row = raw?.has_description_row === true;
+
+      // Guard: never allow "table" mode if the table has multiple data rows.
+      // "table" mode is only for visual layouts with no meaningful row structure.
+      if (mode === "table") {
+        const dataRowCount = lines.filter((l) => {
+          if (!l.includes("|")) return false;
+          if (/^[\|\s]*[-:]+/.test(l)) return false;
+          const cells = l.split("|").slice(1, -1).map((c) => c.trim());
+          if (cells.length >= 2 && cells.every((c) => c === cells[0]) && cells[0]) return false;
+          return cells.some((c) => c.length > 0);
+        }).length;
+        if (dataRowCount > 2) {
+          console.log(`Table mode for ${node.id}: overriding "table" to "row" (${dataRowCount} data rows)`);
+          mode = "row";
+        }
+      }
+
+      // Auto-detect description row if the LLM missed it.
+      if (!has_description_row && (mode === "row" || mode === "cell")) {
+        const firstDataLine = lines.find((l) => {
+          if (!l.includes("|")) return false;
+          if (/^[\|\s]*[-:]+/.test(l)) return false;
+          const cells = l.split("|").slice(1, -1).map((c) => c.trim());
+          return cells.length >= 2 && cells.every((c) => c === cells[0]) && cells[0];
+        });
+        if (firstDataLine) {
+          has_description_row = true;
+          console.log(`Table mode for ${node.id}: auto-detected description row`);
+        }
+      }
       let link_target: TableMode["link_target"] = "none";
       if (raw?.link_target === "row" || raw?.link_target === "column") {
         link_target = raw.link_target;
       }
+      const section_headers = Array.isArray(raw?.section_headers) ? raw.section_headers.map((s: string) => s.trim()) : [];
 
-      console.log(`Table mode for ${node.id}: ${mode} (link_target=${link_target}): ${raw?.reason ?? "no reason"}`);
-      return { mode, link_target, reason: raw?.reason ?? "" };
+      console.log(`Table mode for ${node.id}: ${mode} (link_target=${link_target}, desc=${has_description_row}, sections=${section_headers.length}): ${raw?.reason ?? "no reason"}`);
+      return { mode, link_target, has_description_row, section_headers, reason: raw?.reason ?? "" };
     } catch (err) {
       console.warn(`Table layout detection failed for ${node.id}, using row mode: ${String(err)}`);
-      return { mode: "row", link_target: "none", reason: "fallback" };
+      return { mode: "row", link_target: "none", has_description_row: false, section_headers: [], reason: "fallback" };
     }
   }
 
-  // Even-column tables (4, 6, 8...): LLM decides row vs split_2col.
-  if (colCount >= 4 && colCount % 2 === 0) {
+  // Multi-column tables (≥ 4 cols): LLM decides row vs split_2col/split_3col/split_4col.
+  // This covers even-column tables (4, 6, 8...) and also odd-column tables
+  // divisible by 3 (6, 9, 12...) which could be split_3col.
+  if (colCount >= 4 && (colCount % 2 === 0 || colCount % 3 === 0 || colCount % 4 === 0)) {
     try {
       const prompt = TABLE_LAYOUT_PROMPT_EVEN.replace("{{TABLE_CONTENT}}", node.content);
       const raw = await llmJson<TableMode>(
         env,
         prompt,
         "Return the JSON object with the table layout decision.",
-        { model: env.EXTRACTION_MODEL, maxRetries: 1, schema: TABLE_MODE_SCHEMA }
+        { model: env.ANSWER_MODEL, maxRetries: 1, schema: TABLE_MODE_SCHEMA }
       );
 
-      const mode = raw?.mode === "split_2col" ? "split_2col" : "row";
-      console.log(`Table mode for ${node.id}: ${mode}: ${raw?.reason ?? "no reason"}`);
-      return { mode, link_target: "none", reason: raw?.reason ?? "" };
+      let mode: TableMode["mode"] = "row";
+      if (raw?.mode === "split_2col" || raw?.mode === "split_3col" || raw?.mode === "split_4col" || raw?.mode === "row") {
+        // Validate divisibility: split_2col needs %2, split_3col needs %3, split_4col needs %4.
+        if (raw.mode === "split_2col" && colCount % 2 === 0) mode = "split_2col";
+        else if (raw.mode === "split_3col" && colCount % 3 === 0) mode = "split_3col";
+        else if (raw.mode === "split_4col" && colCount % 4 === 0) mode = "split_4col";
+        else if (raw.mode === "row") mode = "row";
+        else {
+          console.log(`Table mode for ${node.id}: LLM chose ${raw.mode} but colCount=${colCount} not divisible, falling back to row`);
+          mode = "row";
+        }
+      }
+      const has_description_row = raw?.has_description_row === true;
+      const section_headers = Array.isArray(raw?.section_headers) ? raw.section_headers.map((s: string) => s.trim()) : [];
+      console.log(`Table mode for ${node.id}: ${mode} (desc=${has_description_row}, sections=${section_headers.length}): ${raw?.reason ?? "no reason"}`);
+      return { mode, link_target: "none", has_description_row, section_headers, reason: raw?.reason ?? "" };
     } catch (err) {
       console.warn(`Table layout detection failed for ${node.id}, using row mode: ${String(err)}`);
-      return { mode: "row", link_target: "none", reason: "fallback" };
+      return { mode: "row", link_target: "none", has_description_row: false, section_headers: [], reason: "fallback" };
     }
   }
 
-  // Odd-column tables (3, 5, 7...) or 1-column: always row mode.
-  return { mode: "row", link_target: "none", reason: `deterministic: ${colCount} columns` };
+  // Remaining tables (5, 7, 11 cols — not divisible by 2, 3, or 4): always row mode.
+  // Auto-detect description row for deterministic tables.
+  const hasDesc = lines.some((l) => {
+    if (!l.includes("|")) return false;
+    if (/^[\|\s]*[-:]+/.test(l)) return false;
+    const cells = l.split("|").slice(1, -1).map((c) => c.trim());
+    return cells.length >= 2 && cells.every((c) => c === cells[0]) && cells[0];
+  });
+  return { mode: "row", link_target: "none", has_description_row: hasDesc, section_headers: [], reason: `deterministic: ${colCount} columns` };
 }
 
 function buildTableUnits(node: StructureNode, decision: TableMode): DetectedUnit[] {
@@ -352,26 +482,53 @@ function buildTableUnits(node: StructureNode, decision: TableMode): DetectedUnit
     return [{ type: "Rule", name: "", content: node.content }];
   }
 
-  if (decision.mode === "split_2col") {
-    // Split each row into N/2 two-column sub-rows.
+  // Helper: check if a cell/row content matches any section header.
+  const sectionHeaderSet = new Set(decision.section_headers.map((s) => s.trim().toLowerCase()));
+  const matchSectionHeader = (content: string): boolean => {
+    // Extract text from "| text |" format and compare.
+    const text = content.replace(/^\s*\|?\s*/, "").replace(/\s*\|?\s*$/, "").trim().toLowerCase();
+    return sectionHeaderSet.has(text);
+  };
+
+  // split_Ncol modes: split each row into N-column sub-rows.
+  const splitN = decision.mode === "split_2col" ? 2
+    : decision.mode === "split_3col" ? 3
+    : decision.mode === "split_4col" ? 4
+    : 0;
+
+  if (splitN > 0) {
     const lines = node.content.split("\n");
     const units: DetectedUnit[] = [];
+    let currentSectionIdx: number | null = null;
 
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed.startsWith("|")) continue;
       if (/^[\|\s]*[-:]+/.test(trimmed)) continue; // separator row
+      if (isMergedRow(trimmed)) {
+        // Merged-cell row: emit as a single-cell unit.
+        const cells = trimmed.split("|").slice(1, -1).map((c) => c.trim());
+        if (!cells[0]) continue;
+        const unit: DetectedUnit = { type: "Rule", name: "", content: `| ${cells[0]} |` };
+        // If this is a section header, it becomes the parent for subsequent rows.
+        if (matchSectionHeader(cells[0])) {
+          currentSectionIdx = units.length;
+        }
+        units.push(unit);
+        continue;
+      }
 
       const parts = trimmed.split("|");
       const cells = parts.slice(1, -1).map((c) => c.trim());
-      if (cells.length < 4 || cells.length % 2 !== 0) continue;
+      if (cells.length < splitN * 2 || cells.length % splitN !== 0) continue;
 
-      // Emit each 2-cell pair as its own unit.
-      for (let i = 0; i < cells.length; i += 2) {
-        const left = cells[i];
-        const right = cells[i + 1];
-        if (!left && !right) continue;
-        units.push({ type: "Rule", name: "", content: `| ${left} | ${right} |` });
+      // Emit each N-cell group as its own unit.
+      for (let i = 0; i < cells.length; i += splitN) {
+        const group = cells.slice(i, i + splitN);
+        if (group.every((c) => !c)) continue;
+        const d: DetectedUnit = { type: "Rule", name: "", content: `| ${group.join(" | ")} |` };
+        if (currentSectionIdx !== null) d.parentIndex = currentSectionIdx;
+        units.push(d);
       }
     }
     return units;
@@ -390,13 +547,29 @@ function buildTableUnits(node: StructureNode, decision: TableMode): DetectedUnit
       units.push({ type: "Rule", name: "", content: cell.content });
     }
 
+    let currentSectionIdx: number | null = null;
+
     // Data cells link to their row or column header based on the decision.
     for (let r = 1; r < rows.length; r++) {
       const row = rows[r];
+
+      // Check if this is a single-cell row (merged row after collapse).
+      if (row.length === 1) {
+        const d: DetectedUnit = { type: "Rule", name: "", content: row[0].content };
+        if (matchSectionHeader(row[0].content)) {
+          currentSectionIdx = units.length;
+        }
+        units.push(d);
+        continue;
+      }
+
       const rowFirstIdx = units.length;
       for (let c = 0; c < row.length; c++) {
         const d: DetectedUnit = { type: "Rule", name: "", content: row[c].content };
-        if (decision.link_target === "row" && c > 0 && c <= headerIndices.length) {
+        if (currentSectionIdx !== null) {
+          // Section header overrides column headers.
+          d.parentIndex = currentSectionIdx;
+        } else if (decision.link_target === "row" && c > 0 && c <= headerIndices.length) {
           d.parentIndex = rowFirstIdx;
         } else if (decision.link_target === "column" && c < headerIndices.length) {
           d.parentIndex = headerIndices[c];
@@ -407,8 +580,37 @@ function buildTableUnits(node: StructureNode, decision: TableMode): DetectedUnit
     return units;
   }
 
+  // Row mode: each row is one unit. Link data rows to header, header to description.
+  // Section headers override the header as parent for subsequent rows.
   const rows = chunkTableContent(node.content);
-  return rows.map((c) => ({ type: "Rule", name: "", content: c.content }));
+  const units: DetectedUnit[] = rows.map((c) => ({ type: "Rule", name: "", content: c.content }));
+
+  let headerIdx = 0;
+  let dataStart = 1;
+  let currentParent: number | null = null;
+
+  if (decision.has_description_row && rows.length >= 2) {
+    // First row is description, second is header.
+    headerIdx = 1;
+    dataStart = 2;
+    units[headerIdx].parentIndex = 0; // header links to description
+    currentParent = headerIdx;
+  } else if (rows.length >= 2) {
+    currentParent = 0;
+  }
+
+  for (let i = dataStart; i < units.length; i++) {
+    if (matchSectionHeader(units[i].content)) {
+      // This row is a section header — it becomes the new parent.
+      // If there's a header, the section header links to it.
+      if (currentParent !== null) units[i].parentIndex = currentParent;
+      currentParent = i;
+    } else {
+      // Data row links to current parent (header or section header).
+      if (currentParent !== null) units[i].parentIndex = currentParent;
+    }
+  }
+  return units;
 }
 
 function splitIntoChunks(node: StructureNode): Chunk[] {

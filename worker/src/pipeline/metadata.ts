@@ -1,5 +1,9 @@
 import type { Env, SemanticUnit, UnitMetadata } from "../types";
 import { llmJson } from "../utils/llm";
+import { getSemanticUnit } from "../utils/db";
+
+// Cap parent context so the prompt stays within the extraction model's budget.
+const PARENT_CONTEXT_MAX_CHARS = 800;
 
 const METADATA_SCHEMA: Record<string, unknown> = {
   type: "object",
@@ -20,6 +24,12 @@ const METADATA_SCHEMA: Record<string, unknown> = {
 const SYSTEM_PROMPT = `You are a rules-analysis engine for a tabletop RPG rulebook (Russian language).
 Given a single semantic unit, extract structured metadata about it.
 
+If a "Parent Unit" is provided, use it as context: the current unit is a child,
+modifier, or sub-rule of that parent. Incorporate the parent's meaning into the
+summary and keywords where relevant, but only extract defines/references/etc.
+that are explicitly present in the current unit's own text or clearly implied
+by the parent-child relationship.
+
 Respond with ONLY a JSON object of the form:
 {
   "defines": ["term(s) this unit defines"],
@@ -37,7 +47,20 @@ Only use information present in the text. Use empty arrays where nothing applies
 language (Russian) for all extracted strings.`;
 
 export async function extractMetadata(env: Env, unit: SemanticUnit): Promise<UnitMetadata> {
-  const userPrompt = `Type: ${unit.type}\nName: ${unit.name ?? "(unnamed)"}\nSection: ${unit.section.join(" > ")}\nContent:\n${unit.content}`;
+  // Fetch the parent unit (if any) to give the LLM structural context.
+  // This helps with orphan/child units whose meaning depends on their parent
+  // (e.g. a modifier that belongs to a specific spell or age category).
+  let parentContext = "";
+  if (unit.parentUnitId) {
+    const parent = await getSemanticUnit(env, unit.parentUnitId);
+    if (parent) {
+      const parentName = parent.name ?? "(unnamed)";
+      const parentContent = parent.content.slice(0, PARENT_CONTEXT_MAX_CHARS);
+      parentContext = `\nParent Unit (${parent.type}, ${parentName}):\n${parentContent}`;
+    }
+  }
+
+  const userPrompt = `Type: ${unit.type}\nName: ${unit.name ?? "(unnamed)"}\nSection: ${unit.section.join(" > ")}${parentContext}\nContent:\n${unit.content}`;
 
   try {
     const meta = await llmJson<Partial<UnitMetadata>>(env, SYSTEM_PROMPT, userPrompt, { model: env.EXTRACTION_MODEL, schema: METADATA_SCHEMA });

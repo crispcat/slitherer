@@ -17,7 +17,7 @@ export interface Env {
 // ---- Phase 2 structural node, as produced by the local Python parser ----
 export interface StructureNode {
   id: string;
-  type: "document" | "chapter" | "section" | "subsection" | "rule" | "table" | "image" | "note";
+  type: "document" | "chapter" | "section" | "subsection" | "group" | "rule" | "table" | "image" | "note";
   parent: string | null;
   page: number;
   path: string[];

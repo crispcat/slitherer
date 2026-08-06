@@ -67,6 +67,31 @@ MAX_TABLE_ROWS = 30
 MAX_TABLE_CHARS = 4000
 MAX_RULE_CHARS = 4000
 
+# Pseudo-level for group nodes on the heading stack. Higher than any real
+# heading level (1-6) so that any new heading pops the group off the stack.
+GROUP_LEVEL = 99
+
+
+def _is_list_start(text: str) -> bool:
+    """True if the line looks like the start of a list item (bold, numbered, or bullet)."""
+    text = text.strip()
+    if text.startswith("**"):
+        return True
+    if NUMBERED_RULE_RE.match(text):
+        return True
+    if text.startswith(("- ", "+ ", "\u2022 ")):
+        return True
+    return False
+
+
+def _peek_next_non_empty(lines: list[str], start: int) -> str | None:
+    """Return the next non-empty stripped line after index `start`, or None."""
+    for j in range(start, len(lines)):
+        t = lines[j].strip()
+        if t:
+            return t
+    return None
+
 
 def parse(markdown_text: str) -> dict:
     ids = IdCounter()
@@ -171,7 +196,7 @@ def parse(markdown_text: str) -> dict:
     path_titles: list[str] = []
 
     lines = markdown_text.splitlines()
-    for raw_line in lines:
+    for i, raw_line in enumerate(lines):
         line = raw_line.rstrip("\n")
 
         page_m = PAGE_RE.match(line.strip())
@@ -223,6 +248,18 @@ def parse(markdown_text: str) -> dict:
         if not text:
             current_leaf_id = None
             in_list_after_intro = False
+            # Auto-close the current group if the next non-empty line is not a
+            # list item. This prevents groups from absorbing unrelated content
+            # (e.g. implicit sub-headings like "БОЕВОЙ НАВЫК" or paragraphs)
+            # that appears after the list ends but before the next heading.
+            if heading_stack and heading_stack[-1][0] >= GROUP_LEVEL:
+                next_text = _peek_next_non_empty(lines, i + 1)
+                if next_text is None or not _is_list_start(next_text):
+                    heading_stack.pop()
+                    path_titles = [
+                        nodes[nid].path[-1] if nodes[nid].path else _title_of(nodes[nid])
+                        for _, nid in heading_stack[1:]
+                    ]
             continue
 
         # Skip bare bold-marker lines (DOCX conversion artifacts like "**" or "****")
@@ -234,6 +271,51 @@ def parse(markdown_text: str) -> dict:
         is_numbered_or_bullet = bool(NUMBERED_RULE_RE.match(text)) or text.startswith("- ")
         is_bold_start = text.startswith("**")
         is_rule_start = is_numbered_or_bullet or is_bold_start
+
+        # --- Group node detection ---
+        # A standalone line ending with ":" (or ":") whose next non-empty line
+        # is a list item (bold / numbered / bullet) becomes a "group" structural
+        # node. Subsequent list items become children of the group, giving the
+        # tree an explicit category → entries hierarchy. This prevents short
+        # category labels from becoming orphan units and stops later category
+        # labels from bleeding into the last entry of the previous group.
+        if text.endswith((":")) and not is_rule_start:
+            next_text = _peek_next_non_empty(lines, i + 1)
+            if next_text is not None and _is_list_start(next_text):
+                # Pop any existing group (groups are siblings, not nested).
+                while heading_stack and heading_stack[-1][0] >= GROUP_LEVEL:
+                    heading_stack.pop()
+                group_parent = heading_stack[-1][1]
+
+                # Always create a new group node. The previous leaf (if any)
+                # stays as a rule under its original parent — we never convert
+                # an existing bold entry or paragraph into a group, since the
+                # ":"-ending line is the category label, not part of the entry.
+                group_id = ids.next("group")
+                nodes[group_id] = Node(
+                    id=group_id,
+                    type="group",
+                    parent=group_parent,
+                    page=current_page,
+                    path=[],
+                    content=text,
+                )
+                nodes[group_parent].children.append(group_id)
+
+                # Build the group's path from the heading stack + a short title.
+                group_title = text.rstrip(":").strip()
+                new_path = [
+                    nodes[nid].path[-1] if nodes[nid].path else _title_of(nodes[nid])
+                    for _, nid in heading_stack[1:]
+                ]
+                new_path.append(group_title[:80])
+                nodes[group_id].path = new_path
+
+                heading_stack.append((GROUP_LEVEL, group_id))
+                path_titles = new_path
+                current_leaf_id = None
+                in_list_after_intro = False
+                continue
 
         # If the current rule leaf has grown too large, force a new leaf so that
         # downstream semantic detection can work with reasonably sized chunks.
