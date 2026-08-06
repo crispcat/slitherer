@@ -225,7 +225,7 @@ function chunkTableCells(source: string): Chunk[][] {
 }
 
 interface TableMode {
-  mode: "cell" | "row" | "table";
+  mode: "cell" | "row" | "table" | "split_2col";
   link_target: "row" | "column" | "none";
   reason: string;
 }
@@ -240,40 +240,52 @@ const TABLE_MODE_SCHEMA: Record<string, unknown> = {
   required: ["mode", "link_target", "reason"],
 };
 
-const TABLE_LAYOUT_PROMPT = `You are a semantic-layout analyzer for a Russian tabletop RPG rulebook.
+const TABLE_LAYOUT_PROMPT_2COL = `You are a semantic-layout analyzer for a Russian tabletop RPG rulebook.
 
-Given the Markdown table below, decide the best way to split it into search/retrieval units. There are three possible unitization strategies:
+Given the 2-column Markdown table below, decide how to split it into search/retrieval units.
 
-- "cell" — each non-header cell is its own unit.
-  Use this when cells in a row are semantically independent and the column header is the meaningful category. Examples:
-  • a two-column table of "Disadvantages | Advantages"
-  • a two-column table of "Name | Description" (long descriptions are fine)
-  • a two-column table of unrelated rules grouped only by type
+- "cell" — each non-header cell is its own unit, linked to its column header.
+  Use this when the left and right columns are two INDEPENDENT lists. Examples:
+  • "Disadvantages | Advantages" — each cell is a standalone trait
+  • "Name | Description" — each cell is a standalone entry
+  • Two columns of unrelated rules grouped only by type
 
 - "row" — each logical data row is one unit.
-  Use this when all columns together describe one entity, or when the table is a "visual" table (columns placed side-by-side for compactness rather than because they are separate categories). Examples:
-  • attribute tables: "Value | Weapon use | Carry weight | Special"
-  • skill lookup tables: "Н 0 | Полное незнание. | Н 60 | Профессионал."
-  • any table where the first column is the entity and the others are its properties — set link_target to "row"
-  • tables with 3+ columns that are not clearly two independent lists
+  Use this when both columns together form one entity. Examples:
+  • "Value | Meaning" — both cells describe one thing
+  • "Item | Price" — the row is one item with its price
 
 - "table" — the whole table is a single unit.
-  Use this only when the table is purely a visual layout device and the table as a whole expresses one rule that should not be split. Examples:
-  • a paragraph of text reflowed into two columns
-  • a table whose rows are all parts of one large rule and cannot stand alone
-  • a table where the first column repeats the exact same large block of text for every row and the right column is just a list of values belonging to that one block
+  Use this only when the table is a visual layout device (e.g. a paragraph split into columns).
 
-Return ONLY a JSON object with this shape:
-
+Return ONLY a JSON object:
 {"mode": "cell" | "row" | "table", "link_target": "column" | "row" | "none", "reason": "short explanation in English"}
 
-Rules:
-- For a 2-column table where the left and right columns are two categories of the same kind (e.g. "Copper disadvantages | Copper advantages"), choose "cell" with link_target "column".
-- For a 2-column "Name | Description" table, choose "cell" with link_target "column". The code will merge wrapped name+description rows automatically.
-- For 3+ column attribute/skill tables, choose "row". If the first column is the key/entity and the others are its properties, set link_target "row"; otherwise "none".
-- For a 4-column table that is really two independent 2-column sub-tables placed side-by-side (e.g. "Н 0 | Meaning | Н 60 | Meaning"), choose "row" (not cell) because the row is the meaningful compact block.
-- If the first column repeats the same large text for every row (row-span / merged cell), the table is likely a visual table: prefer "row" or "table" over "cell", unless the right column is a clearly independent list.
-- If the table is just a paragraph split into columns, or otherwise cannot be read row-by-row as independent rules, choose "table".
+For "cell" mode, use link_target "column". For "row" mode, use link_target "none". For "table" mode, use link_target "none".
+
+Table:
+{{TABLE_CONTENT}}
+
+Return JSON:`;
+
+const TABLE_LAYOUT_PROMPT_EVEN = `You are a semantic-layout analyzer for a Russian tabletop RPG rulebook.
+
+Given the Markdown table below (which has an even number of columns ≥ 4), decide if it is:
+1. A true multi-column table where all columns together describe one entity per row → choose "row"
+2. Two or more 2-column sub-tables placed side-by-side for compactness → choose "split_2col"
+
+Examples of "split_2col":
+| Значение 1 | Слабый | Значение 4 | Выдающийся |     → two 2-col tables: [Значение 1 | Слабый] and [Значение 4 | Выдающийся]
+| Н 0 | Полное незнание. | Н 60 | Профессионал. |       → two 2-col tables: [Н 0 | Полное незнание.] and [Н 60 | Профессионал.]
+
+Examples of "row" (NOT split_2col):
+| Сл | Оружие | Вес | Могучий Удар |              → all 4 columns are different properties of one row
+| Форма | Первая форма | Вторая форма | Третья форма | → label + 3 values, one entity per row
+
+Key distinction: in "split_2col", columns 1&2 form one logical pair and columns 3&4 form another. In "row", all columns are different aspects of the same entity.
+
+Return ONLY a JSON object:
+{"mode": "row" | "split_2col", "link_target": "none", "reason": "short explanation in English"}
 
 Table:
 {{TABLE_CONTENT}}
@@ -281,32 +293,88 @@ Table:
 Return JSON:`;
 
 async function detectTableMode(env: Env, node: StructureNode): Promise<TableMode> {
-  try {
-    const prompt = TABLE_LAYOUT_PROMPT.replace("{{TABLE_CONTENT}}", node.content);
-    const raw = await llmJson<TableMode>(
-      env,
-      prompt,
-      "Return the JSON object with the table layout decision.",
-      { model: env.EXTRACTION_MODEL, maxRetries: 1, schema: TABLE_MODE_SCHEMA }
-    );
+  const lines = node.content.split("\n");
+  const headerIdx = lines.findIndex((l) => l.includes("|") && !/^[\|\s]*[-:]+/.test(l));
+  const headerLine = headerIdx >= 0 ? lines[headerIdx] : lines[0];
+  const colCount = Math.max(0, (headerLine.match(/\|/g) || []).length - 1);
 
-    const mode = raw?.mode === "cell" || raw?.mode === "row" || raw?.mode === "table" ? raw.mode : "row";
-    let link_target: TableMode["link_target"] = "none";
-    if (raw?.link_target === "row" || raw?.link_target === "column") {
-      link_target = raw.link_target;
+  // 2-column tables: LLM decides cell vs row vs table.
+  if (colCount === 2) {
+    try {
+      const prompt = TABLE_LAYOUT_PROMPT_2COL.replace("{{TABLE_CONTENT}}", node.content);
+      const raw = await llmJson<TableMode>(
+        env,
+        prompt,
+        "Return the JSON object with the table layout decision.",
+        { model: env.EXTRACTION_MODEL, maxRetries: 1, schema: TABLE_MODE_SCHEMA }
+      );
+
+      const mode = raw?.mode === "cell" || raw?.mode === "row" || raw?.mode === "table" ? raw.mode : "row";
+      let link_target: TableMode["link_target"] = "none";
+      if (raw?.link_target === "row" || raw?.link_target === "column") {
+        link_target = raw.link_target;
+      }
+
+      console.log(`Table mode for ${node.id}: ${mode} (link_target=${link_target}): ${raw?.reason ?? "no reason"}`);
+      return { mode, link_target, reason: raw?.reason ?? "" };
+    } catch (err) {
+      console.warn(`Table layout detection failed for ${node.id}, using row mode: ${String(err)}`);
+      return { mode: "row", link_target: "none", reason: "fallback" };
     }
-
-    console.log(`Table mode for ${node.id}: ${mode} (link_target=${link_target}): ${raw?.reason ?? "no reason"}`);
-    return { mode, link_target, reason: raw?.reason ?? "" };
-  } catch (err) {
-    console.warn(`Table layout detection failed for ${node.id}, using row mode: ${String(err)}`);
-    return { mode: "row", link_target: "none", reason: "fallback" };
   }
+
+  // Even-column tables (4, 6, 8...): LLM decides row vs split_2col.
+  if (colCount >= 4 && colCount % 2 === 0) {
+    try {
+      const prompt = TABLE_LAYOUT_PROMPT_EVEN.replace("{{TABLE_CONTENT}}", node.content);
+      const raw = await llmJson<TableMode>(
+        env,
+        prompt,
+        "Return the JSON object with the table layout decision.",
+        { model: env.EXTRACTION_MODEL, maxRetries: 1, schema: TABLE_MODE_SCHEMA }
+      );
+
+      const mode = raw?.mode === "split_2col" ? "split_2col" : "row";
+      console.log(`Table mode for ${node.id}: ${mode}: ${raw?.reason ?? "no reason"}`);
+      return { mode, link_target: "none", reason: raw?.reason ?? "" };
+    } catch (err) {
+      console.warn(`Table layout detection failed for ${node.id}, using row mode: ${String(err)}`);
+      return { mode: "row", link_target: "none", reason: "fallback" };
+    }
+  }
+
+  // Odd-column tables (3, 5, 7...) or 1-column: always row mode.
+  return { mode: "row", link_target: "none", reason: `deterministic: ${colCount} columns` };
 }
 
 function buildTableUnits(node: StructureNode, decision: TableMode): DetectedUnit[] {
   if (decision.mode === "table") {
     return [{ type: "Rule", name: "", content: node.content }];
+  }
+
+  if (decision.mode === "split_2col") {
+    // Split each row into N/2 two-column sub-rows.
+    const lines = node.content.split("\n");
+    const units: DetectedUnit[] = [];
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("|")) continue;
+      if (/^[\|\s]*[-:]+/.test(trimmed)) continue; // separator row
+
+      const parts = trimmed.split("|");
+      const cells = parts.slice(1, -1).map((c) => c.trim());
+      if (cells.length < 4 || cells.length % 2 !== 0) continue;
+
+      // Emit each 2-cell pair as its own unit.
+      for (let i = 0; i < cells.length; i += 2) {
+        const left = cells[i];
+        const right = cells[i + 1];
+        if (!left && !right) continue;
+        units.push({ type: "Rule", name: "", content: `| ${left} | ${right} |` });
+      }
+    }
+    return units;
   }
 
   if (decision.mode === "cell") {
@@ -358,17 +426,37 @@ function isBlockHeading(content: string): boolean {
   return false;
 }
 
-/** Merge consecutive non-heading chunks into the surrounding heading block. */
+/** Merge consecutive non-heading chunks into the surrounding heading block.
+ *  Numbered/bullet items that follow a colon-introduced list are merged into
+ *  the parent block instead of starting new units. */
 function mergeCohesiveChunks(chunks: Chunk[]): DetectedUnit[] {
   if (chunks.length === 0) return [];
 
   const units: DetectedUnit[] = [];
+  let mergingList = false;
+
   for (const chunk of chunks) {
-    if (units.length === 0 || isBlockHeading(chunk.content)) {
+    const isHeading = isBlockHeading(chunk.content);
+    const isNumberedOrBullet = /^\s*(\d+[.\)]\s+|[-+•]\s+)/.test(chunk.content.trim());
+
+    // Check if the previous unit's content ends with ":" (colon-introduced list)
+    const prevContent = units.length > 0 ? units[units.length - 1].content : "";
+    const prevEndsColon = prevContent.trimEnd().endsWith(":");
+
+    if (units.length === 0) {
       units.push({ type: "Rule", name: "", content: chunk.content });
+      mergingList = false;
+    } else if (isNumberedOrBullet && (mergingList || prevEndsColon)) {
+      // This is a list item belonging to a colon-introduced list — merge it.
+      units[units.length - 1].content += chunk.content;
+      mergingList = true;
+    } else if (isHeading) {
+      units.push({ type: "Rule", name: "", content: chunk.content });
+      mergingList = false;
     } else {
       // Append verbatim; chunk.content includes the leading separator from the source.
       units[units.length - 1].content += chunk.content;
+      mergingList = false;
     }
   }
 

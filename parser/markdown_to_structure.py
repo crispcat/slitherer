@@ -80,9 +80,25 @@ def parse(markdown_text: str) -> dict:
     current_page = 1
     current_leaf_id: str | None = None  # accumulates paragraph text into a node
     pending_table_lines: list[str] = []
+    # True while we're appending list items into a colon-introduced parent leaf.
+    in_list_after_intro = False
 
     def parent_of_new_block() -> str:
         return heading_stack[-1][1]
+
+    def last_rule_leaf_of_parent() -> str | None:
+        """Return the id of the last rule/note child of the current heading, or None."""
+        pid = parent_of_new_block()
+        for cid in reversed(nodes[pid].children):
+            if nodes[cid].type in ("rule", "note"):
+                return cid
+        return None
+
+    def ends_with_list_intro(leaf_id: str | None) -> bool:
+        """True if the leaf's content ends with a colon, indicating it introduces a list."""
+        if leaf_id is None:
+            return False
+        return nodes[leaf_id].content.rstrip().endswith(":")
 
     def is_separator_row(line: str) -> bool:
         """A Markdown table separator row only contains dashes/colons/whitespace."""
@@ -97,7 +113,7 @@ def parse(markdown_text: str) -> dict:
         return any(is_separator_row(line) for line in lines)
 
     def flush_table():
-        nonlocal pending_table_lines, current_leaf_id
+        nonlocal pending_table_lines, current_leaf_id, in_list_after_intro
         if not pending_table_lines:
             return
         parent_id = parent_of_new_block()
@@ -138,6 +154,7 @@ def parse(markdown_text: str) -> dict:
 
         pending_table_lines = []
         current_leaf_id = None
+        in_list_after_intro = False
 
     def maybe_split_table():
         nonlocal pending_table_lines
@@ -166,6 +183,7 @@ def parse(markdown_text: str) -> dict:
         if TABLE_ROW_RE.match(line.strip()):
             maybe_split_table()
             pending_table_lines.append(line.strip())
+            in_list_after_intro = False
             continue
         else:
             flush_table()
@@ -198,21 +216,49 @@ def parse(markdown_text: str) -> dict:
             heading_stack.append((level, node_id))
             path_titles = new_path
             current_leaf_id = None
+            in_list_after_intro = False
             continue
 
         text = line.strip()
         if not text:
             current_leaf_id = None
+            in_list_after_intro = False
+            continue
+
+        # Skip bare bold-marker lines (DOCX conversion artifacts like "**" or "****")
+        if re.fullmatch(r"\*+", text):
             continue
 
         parent_id = parent_of_new_block()
         note = text.lower().startswith(("примечание", "note:", "внимание"))
-        is_rule_start = bool(NUMBERED_RULE_RE.match(text)) or text.startswith("- ")
+        is_numbered_or_bullet = bool(NUMBERED_RULE_RE.match(text)) or text.startswith("- ")
+        is_bold_start = text.startswith("**")
+        is_rule_start = is_numbered_or_bullet or is_bold_start
 
         # If the current rule leaf has grown too large, force a new leaf so that
         # downstream semantic detection can work with reasonably sized chunks.
         if current_leaf_id is not None and len(nodes[current_leaf_id].content) >= MAX_RULE_CHARS:
             current_leaf_id = None
+            in_list_after_intro = False
+
+        # Only numbered/bullet items can be merged into a colon-introduced list.
+        # Bold-term "lists" (**Аврианцы.** ...) are separate entities and should
+        # be split into their own nodes so the LLM can link them later.
+        if is_numbered_or_bullet:
+            target = current_leaf_id
+            if target is None:
+                target = last_rule_leaf_of_parent()
+
+            if target is not None and (in_list_after_intro or ends_with_list_intro(target)):
+                nodes[target].content += "\n" + text
+                current_leaf_id = target
+                in_list_after_intro = True
+                continue
+
+            # Not part of a colon-introduced list — start a fresh leaf.
+            in_list_after_intro = False
+        else:
+            in_list_after_intro = False
 
         if current_leaf_id is None or is_rule_start:
             node_type = "note" if note else "rule"
