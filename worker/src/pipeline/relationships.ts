@@ -109,18 +109,32 @@ function extractAdjacencyRelations(unit: SemanticUnit, candidates: SemanticUnit[
 
 /** Build a parent-child relation for units the LLM chose to keep linked rather than merged. */
 function extractParentRelations(unit: SemanticUnit, candidates: SemanticUnit[]): Relation[] {
-  if (!unit.parentUnitId) return [];
-  const parent = candidates.find((c) => c.id === unit.parentUnitId);
-  if (!parent) return [];
-  return [
-    {
-      id: nextId("REL"),
-      source: unit.id,
-      target: parent.id,
-      relation_type: "part_of",
-      confidence: 0.95,
-    },
-  ];
+  const relations: Relation[] = [];
+  if (unit.parentUnitId) {
+    const parent = candidates.find((c) => c.id === unit.parentUnitId);
+    if (parent) {
+      relations.push({
+        id: nextId("REL"),
+        source: unit.id,
+        target: parent.id,
+        relation_type: "part_of",
+        confidence: 0.95,
+      });
+    }
+  }
+  if (unit.secondaryParentUnitId) {
+    const colParent = candidates.find((c) => c.id === unit.secondaryParentUnitId);
+    if (colParent) {
+      relations.push({
+        id: nextId("REL"),
+        source: unit.id,
+        target: colParent.id,
+        relation_type: "part_of",
+        confidence: 0.9,
+      });
+    }
+  }
+  return relations;
 }
 
 interface MetadataRelationResult {

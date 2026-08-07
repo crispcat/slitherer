@@ -28,8 +28,8 @@ export async function upsertStructureNode(env: Env, documentId: string, node: St
 export async function upsertSemanticUnit(env: Env, u: SemanticUnit) {
   await env.DB.prepare(
     `INSERT INTO semantic_units
-       (id, source_node_id, type, name, page, section, content, content_hash, summary, metadata_json, parent_unit_id, source_order, embedding_id, status, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (id, source_node_id, type, name, page, section, content, content_hash, summary, metadata_json, parent_unit_id, secondary_parent_unit_id, source_order, embedding_id, status, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        source_node_id = excluded.source_node_id,
        type = excluded.type,
@@ -41,6 +41,7 @@ export async function upsertSemanticUnit(env: Env, u: SemanticUnit) {
        summary = excluded.summary,
        metadata_json = excluded.metadata_json,
        parent_unit_id = excluded.parent_unit_id,
+       secondary_parent_unit_id = excluded.secondary_parent_unit_id,
        source_order = excluded.source_order,
        embedding_id = excluded.embedding_id,
        status = excluded.status,
@@ -58,6 +59,7 @@ export async function upsertSemanticUnit(env: Env, u: SemanticUnit) {
       u.summary ?? null,
       u.metadata ? JSON.stringify(u.metadata) : null,
       u.parentUnitId ?? null,
+      u.secondaryParentUnitId ?? null,
       u.sourceOrder ?? null,
       u.embeddingId ?? null,
       u.status,
@@ -93,6 +95,7 @@ function rowToUnit(row: any): SemanticUnit {
     id: row.id,
     sourceNodeId: row.source_node_id,
     parentUnitId: row.parent_unit_id,
+    secondaryParentUnitId: row.secondary_parent_unit_id ?? null,
     sourceOrder: row.source_order ?? 0,
     type: row.type,
     name: row.name,
@@ -106,6 +109,29 @@ function rowToUnit(row: any): SemanticUnit {
     status: row.status,
     updatedAt: row.updated_at,
   };
+}
+
+/** Fetch all children of a unit (by primary or secondary parent). */
+export async function getChildrenOfUnit(env: Env, parentId: string): Promise<SemanticUnit[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM semantic_units WHERE parent_unit_id = ? OR secondary_parent_unit_id = ?`
+  )
+    .bind(parentId, parentId)
+    .all();
+  return (results ?? []).map(rowToUnit);
+}
+
+/** Fetch both parents of a unit (row parent + column parent). */
+export async function getParentsOfUnit(
+  env: Env,
+  unit: SemanticUnit
+): Promise<{ row: SemanticUnit | null; col: SemanticUnit | null }> {
+  const ids = [unit.parentUnitId, unit.secondaryParentUnitId].filter((x): x is string => x !== null);
+  if (ids.length === 0) return { row: null, col: null };
+  const units = await getUnitsByIds(env, ids);
+  const row = unit.parentUnitId ? units.find((u) => u.id === unit.parentUnitId) ?? null : null;
+  const col = unit.secondaryParentUnitId ? units.find((u) => u.id === unit.secondaryParentUnitId) ?? null : null;
+  return { row, col };
 }
 
 export async function upsertConcept(env: Env, id: string, name: string, description: string, aliases: string[]) {

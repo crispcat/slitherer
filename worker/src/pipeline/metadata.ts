@@ -59,6 +59,14 @@ export async function extractMetadata(env: Env, unit: SemanticUnit): Promise<Uni
       parentContext = `\nParent Unit (${parent.type}, ${parentName}):\n${parentContent}`;
     }
   }
+  if (unit.secondaryParentUnitId) {
+    const colParent = await getSemanticUnit(env, unit.secondaryParentUnitId);
+    if (colParent) {
+      const colName = colParent.name ?? "(unnamed)";
+      const colContent = colParent.content.slice(0, PARENT_CONTEXT_MAX_CHARS);
+      parentContext += `\nColumn Parent (${colParent.type}, ${colName}):\n${colContent}`;
+    }
+  }
 
   const userPrompt = `Type: ${unit.type}\nName: ${unit.name ?? "(unnamed)"}\nSection: ${unit.section.join(" > ")}${parentContext}\nContent:\n${unit.content}`;
 

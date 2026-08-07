@@ -1,6 +1,7 @@
 import type { Env, StructureDocument } from "./types";
 import { processIngestionBatch, rebuildAllRelationships, startIngestion } from "./pipeline/ingest";
 import { cleanupDocument, getIngestionJob, getUnitsWithUnresolvedRefs } from "./utils/db";
+import { detectSemanticUnits } from "./pipeline/units";
 import { retrieve } from "./retrieval/query";
 import { generateAnswer } from "./retrieval/answer";
 import { uuid } from "./utils/ids";
@@ -155,6 +156,39 @@ export default {
         if (!documentId) return json({ error: "documentId is required" }, 400);
         await cleanupDocument(env, documentId);
         return json({ ok: true, documentId });
+      }
+
+      // POST /ingest/table { node }
+      // Processes a single table node and returns the detected semantic units
+      // WITHOUT saving to DB. Useful for testing table processing in isolation.
+      if (url.pathname === "/ingest/table" && request.method === "POST") {
+        const body = await request.json<any>();
+        const node = body.node;
+        if (!node || node.type !== "table") {
+          return json({ error: "node (type=table) is required" }, 400);
+        }
+        // Process the table and return both the structure and units for debugging.
+        const { detectTableStructure, buildTableUnitsFromTree } = await import("./pipeline/table_tree");
+        const structure = await detectTableStructure(env, node);
+        const detectedUnits = buildTableUnitsFromTree(node, structure);
+        // Convert DetectedUnit[] to SemanticUnit[] (assign IDs).
+        const units = detectedUnits.map((u, i) => ({
+          id: `UNIT-${i}`,
+          type: u.type,
+          sourceOrder: i,
+          parentUnitId: u.parentIndex !== undefined ? `UNIT-${u.parentIndex}` : undefined,
+          secondaryParentUnitId: u.secondaryParentIndex !== undefined ? `UNIT-${u.secondaryParentIndex}` : undefined,
+          content: u.content,
+        }));
+        return json({
+          nodeId: node.id,
+          unitCount: units.length,
+          structure: {
+            row_tree: structure.row_tree,
+            column_tree: structure.column_tree,
+          },
+          units,
+        });
       }
 
       // POST /ingest/rebuild-relations { batchSize?, cursor? }

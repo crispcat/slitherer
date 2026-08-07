@@ -30,16 +30,19 @@ CREATE TABLE IF NOT EXISTS semantic_units (
   content_hash TEXT NOT NULL,
   summary TEXT,
   metadata_json TEXT,          -- raw Phase 4 extraction output (defines/references/requires/exceptions/modifies/modified_by/keywords/aliases)
-  parent_unit_id TEXT,         -- set when this unit was split out of another unit
+  parent_unit_id TEXT,         -- primary parent (row tree: section/header)
+  secondary_parent_unit_id TEXT, -- secondary parent (column tree: column header)
   source_order INTEGER NOT NULL DEFAULT 0, -- position of this unit within its source structure node (for adjacency relations)
   embedding_id TEXT,           -- Vectorize vector id
   status TEXT NOT NULL DEFAULT 'pending', -- pending -> metadata_done -> relations_done -> embedded -> graphed
   updated_at TEXT NOT NULL,
-  FOREIGN KEY (parent_unit_id) REFERENCES semantic_units(id)
+  FOREIGN KEY (parent_unit_id) REFERENCES semantic_units(id),
+  FOREIGN KEY (secondary_parent_unit_id) REFERENCES semantic_units(id)
 );
 CREATE INDEX IF NOT EXISTS idx_semantic_units_source_node ON semantic_units(source_node_id);
 CREATE INDEX IF NOT EXISTS idx_semantic_units_status ON semantic_units(status);
 CREATE INDEX IF NOT EXISTS idx_semantic_units_hash ON semantic_units(content_hash);
+CREATE INDEX IF NOT EXISTS idx_semantic_units_secondary_parent ON semantic_units(secondary_parent_unit_id);
 
 CREATE TABLE IF NOT EXISTS concepts (
   id TEXT PRIMARY KEY,

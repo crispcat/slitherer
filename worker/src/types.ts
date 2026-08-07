@@ -56,6 +56,7 @@ export interface SemanticUnit {
   id: string;
   sourceNodeId: string;
   parentUnitId: string | null;
+  secondaryParentUnitId: string | null;
   sourceOrder: number; // position within the source structure node (for adjacency relations)
   type: SemanticUnitType;
   name: string | null;

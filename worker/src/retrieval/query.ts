@@ -1,6 +1,6 @@
 import type { Env, SemanticUnit } from "../types";
 import { embed, rerank } from "../utils/llm";
-import { getRelationsForUnits, getUnitsByIds } from "../utils/db";
+import { getRelationsForUnits, getUnitsByIds, getChildrenOfUnit, getParentsOfUnit } from "../utils/db";
 import { buildEnrichedDocument } from "../pipeline/embeddings";
 
 export interface RetrievedUnit {
@@ -8,9 +8,10 @@ export interface RetrievedUnit {
   vectorScore?: number;
   rerankScore?: number;
   viaRelation?: string; // relation_type that pulled this unit in via graph expansion, if not a direct hit
+  expansionRole?: "seed" | "row_parent" | "col_parent" | "row_sibling" | "col_sibling";
 }
 
-/** Phase 8 — Retrieval pipeline: vector search -> graph expansion -> dedupe -> rerank. */
+/** Phase 8 — Retrieval pipeline: vector search -> parent expansion -> graph expansion -> dedupe -> rerank. */
 export async function retrieve(
   env: Env,
   question: string,
@@ -33,11 +34,44 @@ export async function retrieve(
 
   const collected = new Map<string, RetrievedUnit>();
   for (const u of seedUnits) {
-    collected.set(u.id, { unit: u, vectorScore: scoreById.get(u.id) });
+    collected.set(u.id, { unit: u, vectorScore: scoreById.get(u.id), expansionRole: "seed" });
+  }
+
+  // 4.5. parent expansion: for each seed, fetch both parents + siblings.
+  const expandedIds = new Set<string>();
+  for (const u of seedUnits) {
+    const { row, col } = await getParentsOfUnit(env, u);
+    if (row) {
+      if (!collected.has(row.id)) expandedIds.add(row.id);
+      const rowSiblings = await getChildrenOfUnit(env, row.id);
+      for (const s of rowSiblings) {
+        if (s.id !== u.id && !collected.has(s.id)) expandedIds.add(s.id);
+      }
+    }
+    if (col) {
+      if (!collected.has(col.id)) expandedIds.add(col.id);
+      const colSiblings = await getChildrenOfUnit(env, col.id);
+      for (const s of colSiblings) {
+        if (s.id !== u.id && !collected.has(s.id)) expandedIds.add(s.id);
+      }
+    }
+  }
+  if (expandedIds.size > 0) {
+    const expandedUnits = await getUnitsByIds(env, [...expandedIds]);
+    for (const u of expandedUnits) {
+      if (!collected.has(u.id)) {
+        // Determine expansion role by checking which parent matches.
+        let role: RetrievedUnit["expansionRole"] = "row_sibling";
+        if (seedUnits.some((s) => s.parentUnitId === u.id)) role = "row_parent";
+        else if (seedUnits.some((s) => s.secondaryParentUnitId === u.id)) role = "col_parent";
+        else if (seedUnits.some((s) => s.secondaryParentUnitId !== null && s.secondaryParentUnitId === u.secondaryParentUnitId)) role = "col_sibling";
+        collected.set(u.id, { unit: u, viaRelation: "parent_expansion", expansionRole: role });
+      }
+    }
   }
 
   // 5-7. expand through the knowledge graph
-  let frontier = seedUnits.map((u) => u.id);
+  let frontier = [...collected.keys()];
   for (let hop = 0; hop < graphHops && frontier.length > 0; hop++) {
     const relations = await getRelationsForUnits(env, frontier);
     const nextIds = new Set<string>();

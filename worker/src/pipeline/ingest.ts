@@ -131,9 +131,20 @@ function statusForPhase(phase: IngestPhase): string {
 }
 
 async function stepUnitsPhase(env: Env, doc: StructureDocument, detail: IngestJobDetail, batchSize: number) {
-  const end = Math.min(detail.cursor + batchSize, detail.nodeIds.length);
+  // Tables require LLM calls (70b model) that can take several seconds each.
+  // Process tables one at a time to avoid exceeding the Worker wall-time limit.
+  const start = detail.cursor;
+  let end = Math.min(start + batchSize, detail.nodeIds.length);
 
-  for (let i = detail.cursor; i < end; i++) {
+  // If the first node in this batch is a table, process only one node.
+  if (end > start + 1) {
+    const firstNode = doc.nodes[detail.nodeIds[start]];
+    if (firstNode?.type === "table") {
+      end = start + 1;
+    }
+  }
+
+  for (let i = start; i < end; i++) {
     const node = doc.nodes[detail.nodeIds[i]];
     if (!node) continue;
 
