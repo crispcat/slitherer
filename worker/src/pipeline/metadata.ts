@@ -1,9 +1,10 @@
 import type { Env, SemanticUnit, UnitMetadata } from "../types";
 import { llmJson } from "../utils/llm";
 import { getSemanticUnit } from "../utils/db";
+import { INGESTION } from "../config.gen";
 
-// Cap parent context so the prompt stays within the extraction model's budget.
-const PARENT_CONTEXT_MAX_CHARS = 800;
+// Cap parent context so the prompt stays within the 70b model's budget.
+const PARENT_CONTEXT_MAX_CHARS = INGESTION.parentContext.maxChars.value;
 
 const METADATA_SCHEMA: Record<string, unknown> = {
   type: "object",
@@ -14,67 +15,54 @@ const METADATA_SCHEMA: Record<string, unknown> = {
     exceptions: { type: "array", items: { type: "string" } },
     modifies: { type: "array", items: { type: "string" } },
     modified_by: { type: "array", items: { type: "string" } },
+    overrides: { type: "array", items: { type: "string" } },
+    related_to: { type: "array", items: { type: "string" } },
+    incompatible_with: { type: "array", items: { type: "string" } },
+    creates: { type: "array", items: { type: "string" } },
+    consumes: { type: "array", items: { type: "string" } },
+    supersedes: { type: "array", items: { type: "string" } },
+    example_of: { type: "array", items: { type: "string" } },
+    part_of: { type: "array", items: { type: "string" } },
     keywords: { type: "array", items: { type: "string" } },
     aliases: { type: "array", items: { type: "string" } },
-    summary: { type: "string" },
   },
-  required: ["summary"],
+  required: [],
 };
 
-const SYSTEM_PROMPT = `You are a rules-analysis engine for a tabletop RPG rulebook (Russian language).
-Given a single semantic unit, extract structured metadata about it.
-
-If a "Parent Unit" is provided, use it as context: the current unit is a child,
-modifier, or sub-rule of that parent. Incorporate the parent's meaning into the
-summary and keywords where relevant, but only extract defines/references/etc.
-that are explicitly present in the current unit's own text or clearly implied
-by the parent-child relationship.
-
-Respond with ONLY a JSON object of the form:
-{
-  "defines": ["term(s) this unit defines"],
-  "references": ["other named mechanics/sections this unit references"],
-  "requires": ["prerequisites for this unit to apply"],
-  "exceptions": ["exceptions to this unit's normal behavior"],
-  "modifies": ["mechanics this unit changes/affects"],
-  "modified_by": ["mechanics that are known to change/affect this unit, if stated"],
-  "keywords": ["salient keywords for search"],
-  "aliases": ["alternate names/synonyms for this unit, if any"],
-  "summary": "one to three sentence plain-language summary of this unit"
-}
-
-Only use information present in the text. Use empty arrays where nothing applies. Keep the original
-language (Russian) for all extracted strings.`;
+const SYSTEM_PROMPT = INGESTION.prompts.metadata.text;
 
 export async function extractMetadata(env: Env, unit: SemanticUnit): Promise<UnitMetadata> {
   // Fetch the parent unit (if any) to give the LLM structural context.
-  // This helps with orphan/child units whose meaning depends on their parent
-  // (e.g. a modifier that belongs to a specific spell or age category).
+  // The parent's summary (generated in the preceding summary phase) is
+  // preferred over raw content for richer, more meaningful context.
   let parentContext = "";
   if (unit.parentUnitId) {
     const parent = await getSemanticUnit(env, unit.parentUnitId);
     if (parent) {
       const parentName = parent.name ?? "(unnamed)";
-      const parentContent = parent.content.slice(0, PARENT_CONTEXT_MAX_CHARS);
-      parentContext = `\nParent Unit (${parent.type}, ${parentName}):\n${parentContent}`;
+      const parentText = (parent.summary ?? parent.content).slice(0, PARENT_CONTEXT_MAX_CHARS);
+      parentContext = `\nParent Unit (${parent.type}, ${parentName}):\n${parentText}`;
     }
   }
   if (unit.secondaryParentUnitId) {
     const colParent = await getSemanticUnit(env, unit.secondaryParentUnitId);
     if (colParent) {
       const colName = colParent.name ?? "(unnamed)";
-      const colContent = colParent.content.slice(0, PARENT_CONTEXT_MAX_CHARS);
-      parentContext += `\nColumn Parent (${colParent.type}, ${colName}):\n${colContent}`;
+      const colText = (colParent.summary ?? colParent.content).slice(0, PARENT_CONTEXT_MAX_CHARS);
+      parentContext += `\nColumn Parent (${colParent.type}, ${colName}):\n${colText}`;
     }
   }
 
-  const userPrompt = `Type: ${unit.type}\nName: ${unit.name ?? "(unnamed)"}\nSection: ${unit.section.join(" > ")}${parentContext}\nContent:\n${unit.content}`;
+  const userPrompt = `Type: ${unit.type}\nName: ${unit.name ?? "(unnamed)"}\nSection: ${unit.section.join(" > ")}\nSummary: ${unit.summary ?? ""}${parentContext}\nContent:\n${unit.content}`;
 
   try {
-    const meta = await llmJson<Partial<UnitMetadata>>(env, SYSTEM_PROMPT, userPrompt, { model: env.EXTRACTION_MODEL, schema: METADATA_SCHEMA });
+    const meta = await llmJson<Partial<UnitMetadata>>(env, SYSTEM_PROMPT, userPrompt, {
+      model: env.ANSWER_MODEL,
+      schema: METADATA_SCHEMA,
+    });
     return normalize(meta);
   } catch {
-    return normalize({ summary: unit.content.slice(0, 240) });
+    return normalize({});
   }
 }
 
@@ -87,8 +75,15 @@ function normalize(m: Partial<UnitMetadata>): UnitMetadata {
     exceptions: arr(m.exceptions),
     modifies: arr(m.modifies),
     modified_by: arr(m.modified_by),
+    overrides: arr(m.overrides),
+    related_to: arr(m.related_to),
+    incompatible_with: arr(m.incompatible_with),
+    creates: arr(m.creates),
+    consumes: arr(m.consumes),
+    supersedes: arr(m.supersedes),
+    example_of: arr(m.example_of),
+    part_of: arr(m.part_of),
     keywords: arr(m.keywords),
     aliases: arr(m.aliases),
-    summary: typeof m.summary === "string" ? m.summary : "",
   };
 }

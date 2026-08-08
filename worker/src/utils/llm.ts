@@ -1,5 +1,6 @@
 import type { Env } from "../types";
 import { jsonrepair } from "jsonrepair";
+import { INGESTION, RETRIEVAL } from "../config.gen";
 
 function extractJsonBlock(text: string): string {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -24,7 +25,7 @@ export async function llmJson<T>(
   opts: { model?: string; maxRetries?: number; schema?: Record<string, unknown> } = {}
 ): Promise<T> {
   const model = opts.model ?? env.EXTRACTION_MODEL;
-  const maxRetries = opts.maxRetries ?? 2;
+  const maxRetries = opts.maxRetries ?? INGESTION.llm.defaultMaxRetries.value;
   const schema = opts.schema ?? { type: "object", additionalProperties: true };
 
   let lastErr: unknown;
@@ -35,7 +36,7 @@ export async function llmJson<T>(
           { role: "system", content: system },
           { role: "user", content: user },
         ],
-        temperature: 0,
+        temperature: INGESTION.llm.jsonTemperature.value,
         response_format: { type: "json_schema", json_schema: schema },
       });
 
@@ -73,7 +74,7 @@ export async function llmText(env: Env, system: string, user: string, model?: st
       { role: "system", content: system },
       { role: "user", content: user },
     ],
-    temperature: 0.2,
+    temperature: INGESTION.llm.textTemperature.value,
   });
   return typeof res === "string" ? res : res.response ?? "";
 }

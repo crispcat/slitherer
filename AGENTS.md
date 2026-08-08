@@ -11,6 +11,15 @@ instructions before running any deployment or DB manipulation task.
 cd worker && npm run deploy
 ```
 
+### Deploy the client (Cloudflare Pages)
+
+```bash
+cd client && npx wrangler pages deploy . --project-name slitherer-rag
+```
+
+The client is a static site (HTML/CSS/JS, no build step) in `client/`.
+It calls the Worker API at the URL configured in the sidebar.
+
 ### Apply DB schema (remote)
 
 ```bash
@@ -46,16 +55,40 @@ rm -f worker/.ingest-state.json
 
 ### Full iteration cycle (cleanup + reparse + redeploy + reingest)
 
-Use the `iterate.sh` script to run the full cycle in one command:
+Use the `iterate` npm script to run the full cycle in one command:
 
 ```bash
-./iterate.sh              # blocks until ingestion completes
-./iterate.sh --no-watch   # starts ingestion in background
+cd worker && npm run iterate              # blocks until ingestion completes
+cd worker && npm run iterate -- --no-watch # starts ingestion in background
+cd worker && npm run iterate -- --stage metadata  # run only the metadata phase
 ```
 
 This cleans local state, reparses `structure.json`, cleans the remote DB,
 deploys the worker, and starts a fresh ingestion. Use this instead of
 running the individual steps manually when iterating on the pipeline.
+
+### Run a single ingestion stage
+
+The ingest script supports `--stage` to run only one phase. When a stage is
+specified, the worker first resets that stage to a clean state (clearing its
+outputs and all downstream stages' outputs), then runs it:
+
+```bash
+cd worker && npm run ingest -- --stage units      # re-detect all units (clears everything)
+cd worker && npm run ingest -- --stage summary    # re-generate summaries + embeddings (clears summary+metadata+relations)
+cd worker && npm run ingest -- --stage metadata   # re-extract metadata (clears metadata+relations)
+cd worker && npm run ingest -- --stage relations  # re-extract relations (clears relations only)
+```
+
+This requires an existing job (use `--fresh` to start one first, or resume
+from a state file). The worker skips ahead to the requested phase and stops
+after it completes.
+
+**What gets cleared per stage:**
+- `units`: semantic_units, embeddings, relations, concepts, keywords (full reset, keeps structure_nodes)
+- `summary`: summaries, embeddings, metadata, relations, concepts, keywords; resets status to `pending`
+- `metadata`: metadata, relations, concepts, keywords; resets status to `summary_done`
+- `relations`: relations only; resets status to `metadata_done`
 
 ## Architecture
 
@@ -108,6 +141,28 @@ Batch testing all tables (parallel, ~60s):
 ### Verification commands
 
 ```bash
-cd worker && npm run typecheck   # TypeScript type checking
-cd worker && npm run deploy      # Deploy to Cloudflare Workers
+cd worker && npm run typecheck   # TypeScript type checking (runs gen-config first)
+cd worker && npm run deploy      # Deploy to Cloudflare Workers (runs gen-config first)
 ```
+
+## Configuration System
+
+All hardcoded values, prompts, model references, and thresholds live in YAML
+files under `config/`:
+
+- `config/ingestion.yaml` — pipeline thresholds, batch sizes, LLM temperatures, all prompts
+- `config/retrieval.yaml` — retrieval thresholds, graph hops, prompts
+- `config/client.yaml` — CORS settings, UI feature flags
+
+A build-time codegen script (`worker/scripts/gen-config.mjs`) reads the YAML
+and generates `worker/src/config.gen.ts` (gitignored), which is imported by
+the worker code. The gen-config step runs automatically before `deploy`,
+`dev`, and `typecheck`.
+
+To change any value:
+1. Edit the YAML file
+2. Run `npm run deploy` (gen-config runs automatically)
+3. Done
+
+Never edit `config.gen.ts` directly — it's auto-generated. The YAML files
+are the source of truth.

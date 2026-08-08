@@ -2,6 +2,7 @@
 
 import type { Env, SemanticUnitType, StructureNode } from "../types";
 import { llmJson } from "../utils/llm";
+import { INGESTION } from "../config.gen";
 
 export interface DetectedUnit {
   type: SemanticUnitType;
@@ -28,128 +29,11 @@ interface TableStructure {
 
 // --- Phase 2a: Row refinement prompt ---
 // The LLM receives the deterministic row skeleton and returns ONLY corrections.
-const ROW_REFINEMENT_PROMPT = `You are reviewing a row classification for a Markdown table. The rows are prefixed with [N] (skip --- separator rows).
-
-Current classification (deterministic skeleton):
-{{SKELETON}}
-
-Rules used by the skeleton:
-- "structural": merged row (all cells identical). Could be a description, section header, or title.
-- "header": non-merged row immediately before a --- separator (standard markdown table header).
-- "data": all other rows (including rows after a --- separator when the pre-separator row was merged).
-- Each data node has exactly 1 row. Parent links to the most recent structural/header node.
-
-Review this classification and return ONLY corrections as a JSON array.
-
-Correction types:
-1. Reclassify a row's role:
-   {"row": <sourceRowIdx>, "new_role": "section"} — this row starts a new category; subsequent data should link to it
-   {"row": <sourceRowIdx>, "new_role": "description"} — this row is a description, not a section
-   {"row": <sourceRowIdx>, "new_role": "header"} — this row is a column header
-   {"row": <sourceRowIdx>, "new_role": "data"} — this row is regular data, not structural
-
-2. Reparent a row (e.g. a description row should chain to the preceding name row):
-   {"row": <sourceRowIdx>, "new_parent": <sourceRowIdx>} — link this row to the specified row instead of its current parent
-
-   IMPORTANT: In many tables, rows alternate between NAMES (short, often with
-   parenthetical notes) and DESCRIPTIONS (longer text starting with a number,
-   "Пассивное", etc.). Chain each description row to the preceding name row:
-   {"row": <descRowIdx>, "new_parent": <nameRowIdx>}
-   This creates a parent→child hierarchy: name → description, so retrieving
-   a name also retrieves its description.
-
-3. Reclassify the entire table as visual (grid/diagram, NOT a data table):
-   {"action": "visual"}
-   Only use this for tables that are NOT real data tables (e.g. layout grids,
-   decorative formatting, diagrams). If the table has multiple data rows with
-   meaningful content, do NOT use "visual".
-
-Rules:
-- Do NOT drop any rows. Every row must remain in the tree.
-- Do NOT create multiple roots. Only the first node can have parent: null.
-- "new_parent" must reference a row that appears BEFORE the current row in the table.
-- If the classification is correct, return: []
-
-Return ONLY a JSON array of corrections: []
-
-Table:
-{{TABLE_CONTENT}}`;
+const ROW_REFINEMENT_PROMPT = INGESTION.prompts.tableRowRefinement.text;
 
 // --- Phase 2b: Column tree prompt ---
 // The LLM builds the column tree from scratch, using the refined row skeleton as context.
-const COLUMN_TREE_PROMPT = `Analyze the columns of this Markdown table and build a column tree as JSON.
-
-The row structure has already been classified:
-{{ROW_SKELETON}}
-
-COLUMN TREE node types:
-- "header": a column header. "cols" lists which 0-based column indices it covers.
-- "data": a column group. "cols" lists which columns belong to this group.
-- "visual": one node covering all columns.
-Each node: {"id","type","cols":[...],"parent":id or null}
-Data nodes should have "parent" pointing to the column header node they belong to.
-
-KEY DECISION: Are columns PROPERTIES of one entity, or INDEPENDENT sub-tables?
-
-SPLIT (independent sub-tables side by side) — each column or column-group is a
-separate list. Data in one column is NOT a property of the other column.
-  - Disadvantages | Advantages (two unrelated lists)
-  - Weapon A stats | Weapon B stats (two separate weapons)
-  - Cost | Effect | Cost | Effect (two separate price lists)
-  - Key | Value | Key | Value (two key-value pair groups side by side)
-  - Merged title row + independent item lists in each column
-    (e.g. "Perks" | "Perks" title, then col 0 = items 1-6, col 1 = items 7-12)
-  - Spell names in col 0 | Spell names in col 1 (two independent spell lists,
-    data rows alternate between names and descriptions)
-→ Create one "data" node per column-group, each with "parent" pointing to its header.
-  Keep key-value pairs TOGETHER in one data node (e.g. cols:[0,1] not cols:[0] and cols:[1]).
-  A merged title row (all cells identical) does NOT mean columns are related —
-  check the DATA rows to decide if columns are independent.
-
-SIMPLE (properties of one entity) — columns describe attributes of the same row.
-  - Attr | Value | Cost (one item per row, columns are its properties)
-  - Name | Description | Price (one entity per row)
-  - Key | Value (one key-value pair per row, both columns describe the same entity)
-  - Level | Property1 | Property2 | Property3 (one level per row, all columns
-    describe that level's attributes)
-→ Create ONE "data" node with ALL columns, parent=null.
-
-HOW TO DECIDE: Look at the DATA rows, not just the header.
-  - If col 0 contains sequential keys (0, 1, 2, ...) and other columns describe
-    properties of each key → SIMPLE (all columns describe the same entity).
-  - If each column contains its own independent list of items (names, descriptions,
-    or values that don't reference each other) → SPLIT.
-  - If data rows alternate between short names and long descriptions in each column
-    independently → SPLIT (each column is its own name→description list).
-
-EXAMPLE — SPLIT (2 columns, independent lists):
-[0]|Disadvantages|Advantages|
-column_tree: [{"id":0,"type":"header","cols":[0],"parent":null},{"id":1,"type":"header","cols":[1],"parent":null},{"id":2,"type":"data","cols":[0],"parent":0},{"id":3,"type":"data","cols":[1],"parent":1}]
-
-EXAMPLE — SPLIT (2 columns, merged title + independent numbered lists):
-[0]|Perks|Perks|
-[2]|1) Item A|7) Item G|
-[3]|2) Item B|8) Item H|
-column_tree: [{"id":0,"type":"header","cols":[0],"parent":null},{"id":1,"type":"header","cols":[1],"parent":null},{"id":2,"type":"data","cols":[0],"parent":0},{"id":3,"type":"data","cols":[1],"parent":1}]
-Note: The merged title row "Perks|Perks" is just a section label. The data rows
-have INDEPENDENT numbered lists (1-6 in col 0, 7-12 in col 1) → SPLIT, not SIMPLE.
-
-EXAMPLE — SPLIT (4 columns, key-value pairs side by side):
-[0]|Key1|Value1|Key2|Value2|
-column_tree: [{"id":0,"type":"header","cols":[0,1],"parent":null},{"id":1,"type":"header","cols":[2,3],"parent":null},{"id":2,"type":"data","cols":[0,1],"parent":0},{"id":3,"type":"data","cols":[2,3],"parent":1}]
-
-EXAMPLE — SPLIT (4 columns, paired):
-[0]|WeaponA|WeaponA|WeaponB|WeaponB|
-column_tree: [{"id":0,"type":"header","cols":[0],"parent":null},{"id":1,"type":"header","cols":[1],"parent":null},{"id":2,"type":"header","cols":[2],"parent":null},{"id":3,"type":"header","cols":[3],"parent":null},{"id":4,"type":"data","cols":[0,1],"parent":0},{"id":5,"type":"data","cols":[2,3],"parent":2}]
-
-EXAMPLE — SIMPLE (multi-property):
-[0]|Attr|Value|Cost|
-column_tree: [{"id":0,"type":"data","cols":[0,1,2],"parent":null}]
-
-Return ONLY JSON: {"column_tree":[...],"reason":"..."}
-
-Table:
-{{TABLE_CONTENT}}`;
+const COLUMN_TREE_PROMPT = INGESTION.prompts.tableColumnTree.text;
 
 /** Check if a table line is a separator row (---, :--:, etc.).
  *  A separator row has ALL cells consisting only of dashes, colons, and spaces. */
@@ -334,7 +218,7 @@ export function applyRowCorrections(
   // or if allowVisual is set (caller determined the table is a grid/diagram).
   if (corrections.some((c) => c.action === "visual")) {
     const dataRowCount = rowTree.filter((tn) => tn.type === "data").length;
-    if (allowVisual || dataRowCount <= 2) {
+    if (allowVisual || dataRowCount <= INGESTION.tableProcessing.visualReclassificationMaxDataRows.value) {
       const allRows = rowTree.flatMap((tn) => tn.rows ?? []);
       return [{ id: 0, type: "visual", rows: allRows, parent: null }];
     }
@@ -418,7 +302,7 @@ async function refineRowSkeleton(
         env,
         prompt,
         "Return a JSON array of corrections. If none needed, return [].",
-        { model: env.ANSWER_MODEL, maxRetries: 0 }
+        { model: env.ANSWER_MODEL, maxRetries: INGESTION.tableProcessing.rowRefinementMaxRetries.value }
       );
 
       if (!Array.isArray(corrections)) {
@@ -467,7 +351,7 @@ async function detectColumnTree(
         env,
         prompt,
         "Return the JSON object with the column tree.",
-        { model: env.ANSWER_MODEL, maxRetries: 0 }
+        { model: env.ANSWER_MODEL, maxRetries: INGESTION.tableProcessing.columnTreeMaxRetries.value }
       );
 
       if (!raw?.column_tree || !Array.isArray(raw.column_tree) || raw.column_tree.length === 0) {
@@ -535,7 +419,7 @@ export async function detectTableStructure(env: Env, node: StructureNode): Promi
   const totalCells = gridCells.reduce((sum, row) => sum + row.length, 0);
   const nonEmptyCells = gridCells.reduce((sum, row) => sum + row.filter((c) => c).length, 0);
   const fillRatio = totalCells > 0 ? nonEmptyCells / totalCells : 1;
-  const allowVisual = fillRatio < 0.7;
+  const allowVisual = fillRatio < INGESTION.tableProcessing.visualCollapseFillRatio.value;
 
   // Phase 2a: Refine row skeleton.
   const refinedRowTree = await refineRowSkeleton(env, node, rowTree, prefixed, allowVisual);
@@ -593,7 +477,7 @@ function overrideColumnTree(
   colCount: number,
 ): TreeNode[] {
   // Rule 2: Very sparse, wide grid → force visual.
-  if (fillRatio < 0.6 && colCount > 10) {
+  if (fillRatio < INGESTION.tableProcessing.sparseGridFillRatio.value && colCount > INGESTION.tableProcessing.sparseGridColumnCount.value) {
     return [{ id: 0, type: "visual", cols: Array.from({ length: colCount }, (_, i) => i), parent: null }];
   }
 

@@ -1,24 +1,30 @@
 import type { Citation, Env, QueryResult } from "../types";
 import type { RetrievedUnit } from "./query";
 import { llmText } from "../utils/llm";
+import { RETRIEVAL } from "../config.gen";
 
-const SYSTEM_PROMPT = `You are a rules-lookup assistant for a tabletop RPG. You answer strictly from the
-supplied evidence (semantic units extracted from the rulebook).
+const SYSTEM_PROMPT = RETRIEVAL.prompts.answer.text;
+const CITATION_ID_PATTERN = new RegExp(RETRIEVAL.answer.citationIdPattern.value, "g");
+const STREAMING_CHUNK_SIZE = RETRIEVAL.pipeline.streamingChunkSize.value;
 
-Rules you MUST follow:
-- Use only the supplied evidence. Never invent rules or fill gaps with assumptions.
-- Every factual claim must cite the unit id(s) it came from, inline, like "(RULE-00042)".
-- If two units conflict, explicitly mention the conflict and which one takes precedence if stated
-  (e.g. via an "overrides"/"supersedes" relation), otherwise say the conflict is unresolved.
-- If the evidence is incomplete or ambiguous, say so explicitly instead of guessing.
-- Answer in the same language as the question.`;
+interface AnswerContext {
+  language: string;
+  subQueries?: string[];
+  gaps?: string[];
+}
 
-export async function generateAnswer(env: Env, question: string, retrieved: RetrievedUnit[]): Promise<QueryResult> {
+export async function generateAnswer(
+  env: Env,
+  question: string,
+  retrieved: RetrievedUnit[],
+  context: AnswerContext
+): Promise<QueryResult> {
   if (retrieved.length === 0) {
     return {
       answer: "В базе знаний не найдено информации, относящейся к этому вопросу.",
       citations: [],
       usedUnitIds: [],
+      language: context.language,
     };
   }
 
@@ -29,10 +35,19 @@ export async function generateAnswer(env: Env, question: string, retrieved: Retr
     )
     .join("\n\n---\n\n");
 
-  const userPrompt = `QUESTION:\n${question}\n\nEVIDENCE:\n${evidence}`;
+  let contextSection = "";
+  if (context.subQueries && context.subQueries.length > 0) {
+    contextSection += `\n\nSearch sub-queries used:\n${context.subQueries.map((q, i) => `${i + 1}. ${q}`).join("\n")}`;
+  }
+  if (context.gaps && context.gaps.length > 0) {
+    contextSection += `\n\nIdentified gaps (information that could not be found):\n${context.gaps.map((g) => `- ${g}`).join("\n")}`;
+  }
+
+  const userPrompt = `QUESTION:\n${question}\n\nEVIDENCE:\n${evidence}${contextSection}\n\nAnswer in language: ${context.language}`;
   const answer = await llmText(env, SYSTEM_PROMPT, userPrompt, env.ANSWER_MODEL);
 
-  const usedUnitIds = [...new Set((answer.match(/[A-Z]+-\d{5}/g) ?? []))].filter((id) =>
+  CITATION_ID_PATTERN.lastIndex = 0;
+  const usedUnitIds = [...new Set((answer.match(CITATION_ID_PATTERN) ?? []))].filter((id) =>
     retrieved.some((r) => r.unit.id === id)
   );
 
@@ -40,5 +55,27 @@ export async function generateAnswer(env: Env, question: string, retrieved: Retr
     .filter((r) => usedUnitIds.includes(r.unit.id))
     .map((r) => ({ unitId: r.unit.id, section: r.unit.section.join(" > "), page: r.unit.page }));
 
-  return { answer, citations, usedUnitIds };
+  return { answer, citations, usedUnitIds, language: context.language };
+}
+
+/** Generate answer as a stream of tokens. Returns an async generator yielding text chunks.
+ *  Used for streaming mode (interactive UI). */
+export async function* generateAnswerStream(
+  env: Env,
+  question: string,
+  retrieved: RetrievedUnit[],
+  context: AnswerContext
+): AsyncGenerator<string, QueryResult, unknown> {
+  // For streaming, we first generate the full answer (Workers AI doesn't support
+  // true token streaming yet), then yield it in chunks to simulate streaming.
+  // When Workers AI adds streaming support, this can be replaced with a real stream.
+  const result = await generateAnswer(env, question, retrieved, context);
+
+  // Yield in chunks to simulate streaming
+  const chunkSize = STREAMING_CHUNK_SIZE;
+  for (let i = 0; i < result.answer.length; i += chunkSize) {
+    yield result.answer.slice(i, i + chunkSize);
+  }
+
+  return result;
 }

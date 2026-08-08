@@ -7,3 +7,4 @@ __pycache__/
 worker/.ingest-state.json
 worker/ingest.log
 worker/.secrets.local
+worker/src/config.gen.ts

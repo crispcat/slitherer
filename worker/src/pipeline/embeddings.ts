@@ -1,46 +1,52 @@
 import type { Env, SemanticUnit } from "../types";
 import { embed } from "../utils/llm";
+import { INGESTION } from "../config.gen";
 
 // bge-m3 supports 8192 input tokens; stay well under it with a conservative budget.
-const MAX_EMBED_TOKENS = 6000;
-const BYTES_PER_TOKEN = 2.5;
+const MAX_EMBED_TOKENS = INGESTION.embedding.maxTokens.value;
+const BYTES_PER_TOKEN = INGESTION.embedding.bytesPerToken.value;
 
 function estimateTokens(text: string): number {
   return Math.ceil(new TextEncoder().encode(text).length / BYTES_PER_TOKEN);
 }
 
-/** Phase 6 — build the enriched embedding document for a semantic unit.
- *  Keeps the input within the model's token budget by relying on structured
- *  metadata + summary, and only including the full original text when the
- *  complete document is guaranteed to fit. */
+/** Phase 6 — build the embedding document for a semantic unit.
+ *
+ *  The embedding is a clean "what is this unit" signal. It contains only:
+ *  - Name (canonical term, when the unit has one)
+ *  - Summary (parent-context-enriched during Phase 4 metadata extraction)
+ *  - Aliases (alternate names/synonyms for terminology matching)
+ *  - Original content (when it fits the token budget — primary signal for
+ *    longer units; for short units like table cells the summary suffices)
+ *
+ *  Deliberately excluded:
+ *  - Chapter/section/type — structural context handled by parent/sibling
+ *    expansion at retrieval time. Type is available as Vectorize metadata
+ *    for future pre-filtering.
+ *  - Keywords — already used for SQL candidate selection in Phase 5; redundant
+ *    in the embedding.
+ *  - Defines/references/requires/exceptions/modifies/modified_by — these are
+ *    relationship descriptors that become typed graph edges in Phase 5.
+ *    Including them here would double-count with graph expansion and dilute
+ *    the embedding's core semantic signal (Design Principle: "Use embeddings
+ *    only for discovery"). */
 export function buildEnrichedDocument(unit: SemanticUnit): string {
-  const chapter = unit.section[0] ?? "";
-  const section = unit.section.slice(1).join(" > ");
   const meta = unit.metadata;
+  const aliases = meta?.aliases?.join(", ") ?? "";
 
-  const parts = [
-    `Chapter: ${chapter}`,
-    `Section: ${section}`,
-    `Unit Name: ${unit.name ?? unit.id}`,
-    `Type: ${unit.type}`,
-    `Summary: ${unit.summary ?? meta?.summary ?? ""}`,
-    `Keywords: ${meta?.keywords?.join(", ") ?? ""}`,
-    `Aliases: ${meta?.aliases?.join(", ") ?? ""}`,
-    `Defines: ${meta?.defines?.join(", ") ?? ""}`,
-    `References: ${meta?.references?.join(", ") ?? ""}`,
-    `Requires: ${meta?.requires?.join(", ") ?? ""}`,
-    `Exceptions: ${meta?.exceptions?.join(", ") ?? ""}`,
-    `Modifies: ${meta?.modifies?.join(", ") ?? ""}`,
-    `Modified By: ${meta?.modified_by?.join(", ") ?? ""}`,
-  ];
+  const parts: string[] = [];
+  if (unit.name) parts.push(`Name: ${unit.name}`);
+  parts.push(`Summary: ${unit.summary ?? ""}`);
+  if (aliases) parts.push(`Aliases: ${aliases}`);
 
   const prefix = parts.join("\n");
   const content = unit.content;
 
-  // Only attach the full original text if the combined document fits entirely.
-  // Otherwise the structured metadata already carries the semantic signal and
-  // the full content is still available to the answer-generation stage.
-  const fullDoc = `${prefix}\nOriginal Text: ${content}`;
+  // Include the full original text when it fits the token budget. For longer
+  // units the content is the primary signal; for short units (table cells,
+  // stat modifiers) the summary already carries the semantic meaning. The full
+  // content is always available to the answer-generation stage regardless.
+  const fullDoc = `${prefix}\n${content}`;
   if (estimateTokens(fullDoc) <= MAX_EMBED_TOKENS) {
     return fullDoc;
   }

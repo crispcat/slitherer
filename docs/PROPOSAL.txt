@@ -1,0 +1,43 @@
+1. Parsing stage (local python stays as-is)
+
+2. Move embeddings stage to after semantic unit extraction stage.
+On this stage:
+- If a semantic unit has a parent or a secondary parent, include the parent/secondary parent text in the generate summary prompt.
+- Using 70b model generate a short concise summary from merged text.
+- Embed a unit using generated summary and store the unit in vector database for retrieval
+
+3. Metadata extraction stage
+- For every unit text + its parents text generate a metadata using 70b model
+Metadata format:
+    defines, 
+    references, 
+    requires, 
+    excepts, 
+    modifies, 
+    modified_by, 
+    overrides, 
+    related_to, 
+    incompatible_with, 
+    creates, 
+    consumes, 
+    supersedes, 
+    example_of, 
+    part_of,
+in json document
+
+Then we make another LLM request and ask it to extract all termins and keywords
+Then we embed this termines and keywords into another vector database for exact termines search
+
+4. On relationships extraction stage
+- For every word in a unit metadata lists we construct a very short precise embeding using a word and very dense summary from semantic_unit text
+- Using this embeding we match over our main vector database for semantic units and construct relations of a word type with a confidence store matched a result from vector db search
+
+5. Retrieval stage 
+ - A conversetional model gets user prompt and makes decision about should it be a RAG request or just a chat message
+ - A conversetional model extracts termines and keywords from user request mathes them agains keywords in keywords vector db and rewrites the user request using matched keywords
+ - Then llm uses rewrited promt to construct a serie of precise rag requests
+ - Then we embed every RAG request and make vector search agains our semantic unit database
+ - Then we rerank matches, take those with acceptable relation store and do graph expand using relations form SQL database also filters by confidence store threshold
+ - Fond semantic units text (both vector mached and expanded) goes back to conversetional model
+ - Conversetional model makes a decision "Is this amount of information is enough to answer the user request?" If no it produces more requests to clarify blind spots or resolve conflicts
+ - When conversetional model has all data it returns an anwer for user request.

@@ -12,9 +12,16 @@ Implements the MVP deliverables from `docs/IMPEMENTATION_PLAN_V1.md` for the
   come from Word's cached `<w:lastRenderedPageBreak/>` markers.
 - **`worker/`** (TypeScript, Cloudflare Workers) — Phases 3-9: semantic unit
   detection/splitting, metadata extraction, relationship extraction,
-  embedding generation, D1 knowledge graph, hybrid retrieval, reranking, and
-  citation-aware answer generation. Uses Workers AI (`AI` binding),
-  Vectorize, D1, and R2.
+  embedding generation, D1 knowledge graph, agentic retrieval (router →
+  decompose → retrieve → sufficiency loop → answer), and citation-aware
+  answer generation. Uses Workers AI (`AI` binding), Vectorize, D1, and R2.
+- **`client/`** (HTML/CSS/JS, Cloudflare Pages) — GPT-like chat UI for the
+  retrieval API. Supports both full (all-in-one) and staged (step-by-step)
+  request modes, SSE token streaming, expandable intermediate thinking
+  steps, and parameter controls for all API options.
+- **`config/`** (YAML) — Externalized configuration for all pipeline values,
+  prompts, model references, and thresholds. Read at build time by
+  `gen-config.mjs` to generate `worker/src/config.gen.ts`.
 
 ## Known MVP limitations
 
@@ -89,16 +96,19 @@ Every protected request must include `Authorization: Bearer <key>`.
 npm run deploy
 ```
 
+The deploy script automatically runs `gen-config` first, which reads the YAML
+config files in `config/` and generates `worker/src/config.gen.ts`. See the
+[Configuration](#configuration) section below for details.
+
 ## 4. Ingest the rulebook
 
-Use `worker/scripts/ingest.mjs` to drive ingestion. It first uploads
-`structure.json` (plus `sourcePath`) to R2 via `POST /ingest/upload`, then
-calls `POST /ingest` with the returned `bucketKey` and loops `/ingest/step`.
-Uploading to R2 first (rather than inlining the JSON in the request body) is
-always automatic — no manual step or size caveat to worry about. It also
-tracks stage/progress, persists a resumable state file (`.ingest-state.json`
-by default), and retries transient errors with backoff while logging full
-error details to `ingest.log`.
+Use `npm run ingest` to drive ingestion. It first uploads `structure.json`
+(plus `sourcePath`) to R2 via `POST /ingest/upload`, then calls `POST /ingest`
+with the returned `bucketKey` and loops `/ingest/step`. Uploading to R2 first
+(rather than inlining the JSON in the request body) is always automatic — no
+manual step or size caveat to worry about. It also tracks stage/progress,
+persists a resumable state file (`.ingest-state.json` by default), and retries
+transient errors with backoff while logging full error details to `ingest.log`.
 
 ```bash
 cd worker
@@ -131,6 +141,43 @@ new job, or `--status-only` to just print the current job status.
 Other useful flags: `--batch-size <n>` (nodes/units per step, default 5),
 `--max-retries <n>` (default 5), `--poll-delay-ms <n>` (default 200).
 
+### Run a single ingestion stage
+
+The `--stage <name>` flag runs only one phase of the ingestion pipeline.
+When a stage is specified, the worker first resets that stage to a clean
+state (clearing its outputs and all downstream stages' outputs), then runs
+it. This is useful for re-running a single phase after changing prompts or
+thresholds without redoing the entire pipeline.
+
+```bash
+cd worker && npm run ingest -- --stage units      # re-detect all units
+cd worker && npm run ingest -- --stage summary    # re-generate summaries + embeddings
+cd worker && npm run ingest -- --stage metadata   # re-extract metadata
+cd worker && npm run ingest -- --stage relations  # re-extract relations
+```
+
+This requires an existing job (use `--fresh` to start one first, or resume
+from a state file). The worker skips ahead to the requested phase and stops
+after it completes.
+
+**What gets cleared per stage:**
+- `units`: semantic_units, embeddings, relations, concepts, keywords (full reset, keeps structure_nodes)
+- `summary`: summaries, embeddings, metadata, relations, concepts, keywords; resets status to `pending`
+- `metadata`: metadata, relations, concepts, keywords; resets status to `summary_done`
+- `relations`: relations only; resets status to `metadata_done`
+
+### Full iteration cycle
+
+The `npm run iterate` script runs the full cycle in one command: clean local
+state, reparse `structure.json`, clean remote DB, deploy worker, start fresh
+ingestion.
+
+```bash
+cd worker && npm run iterate              # blocks until ingestion completes
+cd worker && npm run iterate -- --no-watch # starts ingestion in background
+cd worker && npm run iterate -- --stage metadata  # iterate but only run metadata phase
+```
+
 ## 5. Query
 
 ```bash
@@ -148,3 +195,25 @@ Re-run the parser on an updated DOCX, then POST the new `structure.json` to
 each structure node's content and skips re-running Phases 3-7 for any node
 whose semantic units already have a matching `content_hash`, only
 reprocessing (and re-embedding/re-graphing) changed nodes.
+
+## Configuration
+
+All hardcoded values, prompts, model references, and thresholds are
+externalized into YAML files under `config/`:
+
+- `config/ingestion.yaml` — pipeline thresholds, batch sizes, LLM temperatures, all ingestion prompts
+- `config/retrieval.yaml` — retrieval thresholds, graph hops, all retrieval prompts
+- `config/client.yaml` — CORS settings, UI feature flags
+
+A build-time codegen script (`worker/scripts/gen-config.mjs`) reads the YAML
+and generates `worker/src/config.gen.ts` (gitignored), which is imported by
+the worker code. The gen-config step runs automatically before `deploy`,
+`dev`, and `typecheck`.
+
+To change any value:
+1. Edit the YAML file (e.g. `config/retrieval.yaml`)
+2. Run `npm run deploy` (gen-config runs automatically first)
+3. Done
+
+Never edit `config.gen.ts` directly — it's auto-generated. The YAML files
+are the source of truth.

@@ -6,6 +6,7 @@
  *   - a resumable state file, so a crashed/interrupted run can continue from
  *     the exact same job instead of restarting from scratch
  *   - retry with backoff on transient errors, and a structured error log
+ *   - --stage <name> to run only a single ingestion phase
  *
  * Usage:
  *   node scripts/ingest.mjs \
@@ -13,6 +14,11 @@
  *     --structure ../rulebooks/deorim_rules.structure.json \
  *     --document-id deorim_rules \
  *     --source-path rulebooks/deorim_rules.docx
+ *
+ *   # Run only a specific stage:
+ *   node scripts/ingest.mjs --stage summary
+ *   node scripts/ingest.mjs --stage metadata
+ *   node scripts/ingest.mjs --stage relations
  *
  * Re-running with the same --state file resumes an in-progress or failed job.
  */
@@ -33,6 +39,7 @@ function parseArgs(argv) {
     maxRetries: 5,
     statusOnly: false,
     fresh: false,
+    stage: null, // null = run all stages; otherwise "units"|"summary"|"metadata"|"relations"
     apiKey: process.env.ADMIN_API_KEY ?? null,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -50,6 +57,7 @@ function parseArgs(argv) {
       case "--max-retries": args.maxRetries = parseInt(next(), 10); break;
       case "--status-only": args.statusOnly = true; break;
       case "--fresh": args.fresh = true; break;
+      case "--stage": args.stage = next(); break;
       case "--api-key": args.apiKey = next(); break;
       default:
         console.error(`Unknown argument: ${a}`);
@@ -62,6 +70,11 @@ function parseArgs(argv) {
   }
   if (!args.apiKey) {
     console.error("Missing admin API key. Pass --api-key <key> or set ADMIN_API_KEY env var.");
+    process.exit(1);
+  }
+  const VALID_STAGES = ["units", "summary", "metadata", "relations"];
+  if (args.stage && !VALID_STAGES.includes(args.stage)) {
+    console.error(`Invalid --stage: ${args.stage}. Valid stages: ${VALID_STAGES.join(", ")}`);
     process.exit(1);
   }
   return args;
@@ -186,7 +199,7 @@ function sleep(ms) {
 }
 
 async function main() {
-  await log("INFO", "Ingestion run starting", { url: args.url });
+  await log("INFO", "Ingestion run starting", { url: args.url, stage: args.stage ?? "all" });
 
   let state = args.fresh ? null : await loadState();
 
@@ -247,10 +260,26 @@ async function main() {
     await log("STAGE", "Resuming existing ingestion job from state file", state);
   }
 
+  // If --stage is specified, reset that stage to a clean state before running.
+  // This clears the stage's outputs and all downstream stages' outputs.
+  if (args.stage) {
+    await log("STAGE", `Resetting stage '${args.stage}' to clean state`, { documentId: args.documentId });
+    const resetResult = await withRetry(
+      () => postJson("/ingest/reset-stage", { documentId: args.documentId, stage: args.stage }),
+      "POST /ingest/reset-stage"
+    );
+    await log("STAGE", `Stage reset complete`, resetResult);
+    // Update state phase to the target stage
+    state.phase = args.stage;
+    await saveState(state);
+  }
+
   let lastPhase = state.phase;
   while (true) {
+    const stepBody = { jobId: state.jobId, batchSize: args.batchSize };
+    if (args.stage) stepBody.stage = args.stage;
     const result = await withRetry(
-      () => postJson("/ingest/step", { jobId: state.jobId, batchSize: args.batchSize }),
+      () => postJson("/ingest/step", stepBody),
       "POST /ingest/step"
     );
 
@@ -282,7 +311,10 @@ async function main() {
     if (result.done) {
       state.finishedAt = nowIso();
       await saveState(state);
-      await log("DONE", "Ingestion complete", state);
+      const doneMsg = args.stage
+        ? `Stage '${args.stage}' complete`
+        : "Ingestion complete";
+      await log("DONE", doneMsg, state);
       break;
     }
 

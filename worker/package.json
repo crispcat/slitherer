@@ -3,15 +3,19 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "dev": "npm run gen-config && wrangler dev",
+    "deploy": "npm run gen-config && wrangler deploy",
+    "gen-config": "node scripts/gen-config.mjs",
     "db:migrate:local": "wrangler d1 execute slitherer-rag-db --local --file=./schema.sql",
     "db:migrate:remote": "wrangler d1 execute slitherer-rag-db --remote --file=./schema.sql",
-    "typecheck": "tsc --noEmit",
-    "ingest": "node scripts/ingest.mjs"
+    "typecheck": "npm run gen-config && tsc --noEmit",
+    "ingest": "node scripts/ingest.mjs",
+    "iterate": "node scripts/iterate.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250101.0",
+    "@types/js-yaml": "^4.0.9",
+    "js-yaml": "^5.2.3",
     "typescript": "^5.5.4",
     "wrangler": "^3.90.0"
   },

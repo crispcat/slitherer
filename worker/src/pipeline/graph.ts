@@ -22,7 +22,7 @@ export async function populateConceptsAndKeywords(env: Env, unit: SemanticUnit) 
     let conceptId = await getConceptIdByName(env, name);
     if (!conceptId) {
       conceptId = nextId("CONCEPT");
-      await upsertConcept(env, conceptId, name, unit.summary ?? unit.metadata?.summary ?? "", unit.metadata?.aliases ?? []);
+      await upsertConcept(env, conceptId, name, unit.summary ?? "", unit.metadata?.aliases ?? []);
     }
     await linkConceptUnit(env, conceptId, unit.id);
   }

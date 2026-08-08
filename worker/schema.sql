@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS semantic_units (
   secondary_parent_unit_id TEXT, -- secondary parent (column tree: column header)
   source_order INTEGER NOT NULL DEFAULT 0, -- position of this unit within its source structure node (for adjacency relations)
   embedding_id TEXT,           -- Vectorize vector id
-  status TEXT NOT NULL DEFAULT 'pending', -- pending -> metadata_done -> relations_done -> embedded -> graphed
+  status TEXT NOT NULL DEFAULT 'pending', -- pending -> summary_done -> metadata_done -> relations_done -> done
   updated_at TEXT NOT NULL,
   FOREIGN KEY (parent_unit_id) REFERENCES semantic_units(id),
   FOREIGN KEY (secondary_parent_unit_id) REFERENCES semantic_units(id)
@@ -83,9 +83,30 @@ CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target_id);
 CREATE TABLE IF NOT EXISTS ingestion_jobs (
   id TEXT PRIMARY KEY,
   document_id TEXT NOT NULL,
-  phase TEXT NOT NULL,   -- structure|units|metadata|relations|embeddings|graph|done
+  phase TEXT NOT NULL,   -- units|summary|metadata|relations|done
   status TEXT NOT NULL,  -- running|done|error
   detail TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+-- Query pipeline tables
+
+CREATE TABLE IF NOT EXISTS conversations (
+  id TEXT PRIMARY KEY,
+  messages TEXT NOT NULL,    -- JSON array of {role, content}
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS query_logs (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT,
+  step TEXT NOT NULL,        -- router|decompose|retrieve|sufficiency|answer
+  input TEXT NOT NULL,       -- JSON: step input
+  output TEXT NOT NULL,      -- JSON: step output
+  duration_ms INTEGER,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+);
+CREATE INDEX IF NOT EXISTS idx_query_logs_conversation ON query_logs(conversation_id);

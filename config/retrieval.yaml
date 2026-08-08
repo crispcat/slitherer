@@ -1,0 +1,282 @@
+# Retrieval pipeline configuration.
+# All prompts, thresholds, models, and mode switches for the agentic retrieval
+# pipeline (router → decompose → retrieve → sufficiency loop → answer).
+
+models:
+  router:
+    binding: EXTRACTION_MODEL
+    default: "@cf/meta/llama-3.1-8b-instruct-fast"
+    description: >-
+      Used for Step 1 router (RAG/chat classification + language detection +
+      translation) and chat responses
+    file: retrieval/router.ts
+
+  decompose:
+    binding: ANSWER_MODEL
+    default: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    description: >-
+      Used for Step 2 query decomposition into sub-queries + dynamic rerank threshold
+    file: retrieval/decompose.ts
+
+  sufficiency:
+    binding: ANSWER_MODEL
+    default: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    description: Used for Step 5 sufficiency check + follow-up query generation
+    file: retrieval/sufficiency.ts
+
+  answer:
+    binding: ANSWER_MODEL
+    default: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    description: Used for Step 6 answer generation with citations
+    file: retrieval/answer.ts
+
+  embedding:
+    binding: EMBEDDING_MODEL
+    default: "@cf/baai/bge-m3"
+    description: Used for query embedding in Step 3 vector search (1024-dim)
+    file: retrieval/query.ts
+
+  rerank:
+    binding: RERANK_MODEL
+    default: "@cf/baai/bge-reranker-base"
+    description: Used for per-sub-query reranking in Step 4
+    file: retrieval/query.ts
+
+pipeline:
+  historyTurns:
+    value: 6
+    description: >-
+      Number of conversation turns (3 user + 3 assistant) passed to router and
+      decomposer for context
+    file: retrieval/pipeline.ts
+
+  maxIterations:
+    value: 3
+    description: >-
+      Maximum retrieval iterations (initial + 2 follow-ups).
+      Configurable via API parameter.
+    file: retrieval/pipeline.ts
+
+  graphHops:
+    value: 2
+    description: >-
+      Default graph expansion hops. Configurable via API parameter
+      (labeled 'Semantical Net Width' in UI).
+    file: retrieval/pipeline.ts
+
+  streamingChunkSize:
+    value: 50
+    description: >-
+      Character chunk size for simulated streaming (when Workers AI doesn't
+      support true token streaming)
+    file: retrieval/pipeline.ts, retrieval/answer.ts
+
+  logTruncateLength:
+    value: 80
+    description: Character length for truncating question/query in console.log output
+    file: retrieval/pipeline.ts
+
+retrieval:
+  similarityThreshold:
+    value: 0.5
+    description: Minimum vector similarity for a match to be kept after vector search
+    file: retrieval/query.ts
+
+  relationConfidenceThreshold:
+    value: 0.5
+    description: >-
+      Minimum relation confidence for graph expansion — relations below this
+      are not followed
+    file: retrieval/query.ts
+
+  vectorCandidatePool:
+    value: 100
+    description: >-
+      Candidate pool per sub-query for vector search (topK).
+      Cast a wide net, filter by similarity threshold.
+    file: retrieval/query.ts
+
+  defaultRerankThreshold:
+    value: 0.3
+    description: >-
+      Default rerank threshold if not provided by decomposer.
+      The decomposer normally sets this dynamically (0.2-0.5).
+    file: retrieval/query.ts
+
+decomposition:
+  maxSubQueries:
+    value: 5
+    description: Maximum number of sub-queries from decomposition
+    file: retrieval/decompose.ts
+
+  fallbackRerankThreshold:
+    value: 0.3
+    description: Fallback rerank threshold if LLM returns invalid value
+    file: retrieval/decompose.ts
+
+  rerankThresholdRanges:
+    precise:
+      min: 0.4
+      max: 0.5
+      description: Precise lookup questions (e.g. 'what is the DC for X?')
+
+    exploratory:
+      min: 0.2
+      max: 0.3
+      description: Exploratory questions (e.g. 'tell me about combat mechanics')
+
+    interaction:
+      min: 0.3
+      max: 0.4
+      description: Questions about interactions between mechanics
+
+sufficiency:
+  maxFollowUpQueries:
+    value: 5
+    description: Maximum number of follow-up queries generated per sufficiency check
+    file: retrieval/sufficiency.ts
+
+router:
+  fallbackRag:
+    value: true
+    description: >-
+      If the router LLM fails, default to RAG=true (safer to do unnecessary
+      retrieval than miss a real question)
+    file: retrieval/router.ts
+
+  fallbackLanguage:
+    value: ru
+    description: Default language if router fails
+    file: retrieval/router.ts
+
+answer:
+  citationIdPattern:
+    value: '[A-Z]+-\d{5}'
+    description: Regex pattern for extracting unit IDs from generated answer for citation extraction
+    file: retrieval/answer.ts
+
+llm:
+  jsonTemperature:
+    value: 0
+    description: Temperature for JSON mode LLM calls (deterministic)
+    file: utils/llm.ts
+
+  textTemperature:
+    value: 0.2
+    description: Temperature for text generation LLM calls (low creativity)
+    file: utils/llm.ts
+
+  defaultMaxRetries:
+    value: 2
+    description: Default retry count for LLM calls
+    file: utils/llm.ts
+
+prompts:
+  router:
+    description: >-
+      System prompt for Step 1 router (8b) — RAG/chat classification +
+      language detection + Russian translation
+    file: retrieval/router.ts
+    text: |-
+      You are a query router for a tabletop RPG rules-lookup system. The rulebook is in Russian.
+
+      Given a user message (and optional conversation history), decide:
+
+      1. **rag**: Does this message require looking up rules in the rulebook?
+         - true: questions about game mechanics, rules, stats, spells, items, interactions, etc.
+         - false: greetings, thanks, follow-up requests like "rephrase that", "explain it simpler",
+           "give me an example", meta-questions about the system itself, or general chat.
+
+      2. **language**: The language code of the user's message (e.g. "ru", "uk", "en", "es").
+
+      3. **russian_query**: Translate the user's message to Russian. If already in Russian, return it unchanged.
+         This translation is used for retrieval — the rulebook is in Russian, so search works best in Russian.
+         Preserve the full meaning and all mentioned terms.
+
+      4. **chat_response** (only when rag=false): A direct response to the user's message.
+         For "rephrase that" or "explain it simpler" requests, rephrase the last assistant message from
+         the conversation history in simpler terms. For greetings/thanks, respond naturally.
+         Respond in the user's language (matching the detected language).
+
+      Respond with ONLY a JSON object.
+
+  chatResponse:
+    description: >-
+      System prompt for direct chat response when rag=false (8b).
+      Template with ${language}
+    file: retrieval/router.ts
+    text: |-
+      You are a helpful assistant for a tabletop RPG rules-lookup system. Respond naturally in ${language}. If the user is asking about game rules, suggest they ask a specific rules question.
+
+  decompose:
+    description: >-
+      System prompt for Step 2 query decomposition (70b) — breaks question into
+      sub-queries + sets dynamic rerank threshold
+    file: retrieval/decompose.ts
+    text: |-
+      You are a query decomposition engine for a tabletop RPG rules-lookup system. The rulebook is in Russian.
+
+      Given a user's question (in Russian), break it down into focused sub-queries for vector search.
+
+      Rules:
+      - Each sub-query should target ONE specific aspect of the question.
+      - Simple questions that ask about one mechanic should produce a single sub-query (the original question).
+      - Complex questions about multiple interacting mechanics should be decomposed into 1-5 sub-queries.
+      - Each sub-query should be a focused search phrase in Russian, optimized for semantic similarity search.
+      - Sub-queries should NOT overlap too much — each should find different units.
+
+      Also decide a **rerank_threshold** (0.0 to 1.0) based on the question type:
+      - Precise lookup questions (e.g. "what is the DC for X?") → higher threshold (0.4-0.5): only return
+        highly relevant results.
+      - Exploratory questions (e.g. "tell me about combat mechanics") → lower threshold (0.2-0.3): return
+        a broader set of relevant results.
+      - Questions about interactions between mechanics → medium threshold (0.3-0.4).
+
+      Respond with ONLY a JSON object:
+      {"sub_queries": ["...", "..."], "rerank_threshold": 0.35}
+
+  sufficiency:
+    description: >-
+      System prompt for Step 5 sufficiency check (70b) — structured checklist for
+      coverage, interactions, contradictions, completeness
+    file: retrieval/sufficiency.ts
+    text: |-
+      You are a sufficiency evaluator for a tabletop RPG rules-lookup system. The rulebook is in Russian.
+
+      Given a question (in Russian) and the evidence retrieved so far (grouped by sub-query), evaluate whether
+      the evidence is sufficient to answer the question completely.
+
+      Run through this checklist systematically:
+
+      1. **Coverage**: Does the evidence cover every mechanic, term, or concept mentioned in the question?
+      2. **Interactions**: If the question asks about interactions between mechanics, is there evidence
+         describing how they interact (not just definitions of each)?
+      3. **Contradictions**: Are there contradictions in the evidence? If so, is there evidence that resolves
+         them (e.g. an overrides/supersedes relation)?
+      4. **Completeness**: Is there any aspect of the question that the evidence doesn't address at all?
+
+      If ALL checklist items pass → sufficient: true.
+      If any item fails → sufficient: false, describe the gaps, and generate focused follow-up queries
+      (in Russian) to fill those gaps. Follow-up queries should be specific search phrases targeting
+      the missing information.
+
+      Respond with ONLY a JSON object:
+      {"sufficient": true/false, "gaps": ["..."], "follow_up_queries": ["..."]}
+
+  answer:
+    description: >-
+      System prompt for Step 6 answer generation (70b) — citation-backed answer
+      from evidence
+    file: retrieval/answer.ts
+    text: |-
+      You are a rules-lookup assistant for a tabletop RPG. You answer strictly from the
+      supplied evidence (semantic units extracted from the rulebook).
+
+      Rules you MUST follow:
+      - Use only the supplied evidence. Never invent rules or fill gaps with assumptions.
+      - Every factual claim must cite the unit id(s) it came from, inline, like "(RULE-00042)".
+      - If two units conflict, explicitly mention the conflict and which one takes precedence if stated
+        (e.g. via an "overrides"/"supersedes" relation), otherwise say the conflict is unresolved.
+      - If the evidence is incomplete or ambiguous, say so explicitly instead of guessing.
+      - Answer in the user's language (specified below).
+      - If gaps were identified during retrieval, acknowledge what you could not find.

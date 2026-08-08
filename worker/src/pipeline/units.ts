@@ -4,6 +4,7 @@ import { llmJson } from "../utils/llm";
 import { sha256 } from "../utils/hash";
 import { nextId } from "../utils/ids";
 import { detectTableStructure, buildTableUnitsFromTree } from "./table_tree";
+import { INGESTION } from "../config.gen";
 
 interface DetectedUnit {
   type: SemanticUnitType;
@@ -132,46 +133,31 @@ const ORPHAN_SCHEMA: Record<string, unknown> = {
   },
 };
 
+const ORPHAN_PROMPT_TEMPLATE = INGESTION.prompts.orphanResolution.text;
+const ORPHAN_BOLD_HEADING_MAX = INGESTION.orphanResolution.boldHeadingMaxLength.value;
+const ORPHAN_CONTENT_MAX = INGESTION.orphanResolution.contentMaxLength.value;
+const ORPHAN_MAX_RETRIES = INGESTION.orphanResolution.maxRetries.value;
+
 function buildOrphanResolutionPrompt(node: StructureNode, units: DetectedUnit[]): string {
   const sectionPath = node.path.length > 0 ? node.path.join(" > ") : "(root)";
   const unitList = units
     .map((u, i) => `--- Unit ${i} (${u.type}${u.name ? ", name: " + u.name : ""}) ---\n${u.content}`)
     .join("\n\n");
 
-  return `You are a rules-parsing engine for a tabletop RPG rulebook (Russian language).
-Some of the detected semantic units below are "orphans": short fragments (e.g. stat modifiers like "+1З, +1Э", bonuses, penalties, exceptions, or conditions) that have no standalone meaning and clearly belong to a preceding unit.
-
-For each orphan, decide whether to:
-- "merge": combine its content into the preceding unit it belongs to.
-- "link": keep it as a separate unit but mark it as a child of the preceding unit (use this when the fragment is a distinct related sub-rule, example, or exception worth keeping separately).
-
-Only pick a "preceding" unit (parent_index < unit_index) from the list. If a unit makes sense on its own, do NOT include it.
-
-Node type: ${node.type}
-Section path: ${sectionPath}
-
-Original text:
-${node.content}
-
-Detected units:
-${unitList}
-
-Respond with ONLY a JSON array of decisions, no prose, of the form:
-[{"unit_index": 1, "action": "merge", "parent_index": 0, "reason": "it is the stat modifier for the age category"}]
-
-Rules:
-- Do not merge distinct list items, distinct spells, distinct weapons, or independent rules.
-- Do not choose a parent that itself is being merged; if necessary, point to the final parent (the first non-merged unit in the chain).
-- Preserve original language, case, and formatting.`;
+  return ORPHAN_PROMPT_TEMPLATE
+    .replace("${node.type}", node.type)
+    .replace("${sectionPath}", sectionPath)
+    .replace("${node.content}", node.content)
+    .replace("${unitList}", unitList);
 }
 
 function isOrphanCandidate(unit: DetectedUnit): boolean {
   // A short bold heading is a complete entity, not an orphan modifier.
   const firstLine = unit.content.trim().split("\n")[0].trim();
-  if (firstLine.startsWith("**") && firstLine.length < 60) return false;
+  if (firstLine.startsWith("**") && firstLine.length < ORPHAN_BOLD_HEADING_MAX) return false;
 
   // Short fragments, unnamed modifiers, and stat-like lines are the most common orphans.
-  if (unit.content.length < 60) return true;
+  if (unit.content.length < ORPHAN_CONTENT_MAX) return true;
   if (!unit.name || unit.name.length === 0) {
     if (/^[\+\-]\d/.test(firstLine) || /^\d+[\p{L}]/u.test(firstLine)) return true;
   }
@@ -193,7 +179,7 @@ async function resolveOrphanUnits(
       env,
       buildOrphanResolutionPrompt(node, units),
       "Return the JSON array of orphan resolution decisions.",
-      { model: env.EXTRACTION_MODEL, maxRetries: 1, schema: ORPHAN_SCHEMA }
+      { model: env.EXTRACTION_MODEL, maxRetries: ORPHAN_MAX_RETRIES, schema: ORPHAN_SCHEMA }
     );
 
     if (!Array.isArray(raw) || raw.length === 0) return units;

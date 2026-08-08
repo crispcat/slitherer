@@ -1,0 +1,389 @@
+# Ingestion pipeline configuration.
+# All prompts, thresholds, models, batch sizes, and mode switches for Phases 3-5.
+
+models:
+  embedding:
+    binding: EMBEDDING_MODEL
+    default: "@cf/baai/bge-m3"
+    description: >-
+      Used for summary-phase embeddings and relationship extraction term probes
+      (1024-dim, 8192 token input)
+
+  extraction:
+    binding: EXTRACTION_MODEL
+    default: "@cf/meta/llama-3.1-8b-instruct-fast"
+    description: >-
+      Used for Phase 3 orphan resolution (high-volume, low-stakes merge/link decisions)
+
+  answer:
+    binding: ANSWER_MODEL
+    default: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    description: >-
+      Used for Phase 3 table row/column tree, summary generation, metadata extraction
+
+  rerank:
+    binding: RERANK_MODEL
+    default: "@cf/baai/bge-reranker-base"
+    description: Not used during ingestion (only retrieval)
+
+embedding:
+  maxTokens:
+    value: 6000
+    description: >-
+      Maximum tokens for embedding document (bge-m3 supports 8192, we leave headroom)
+    file: pipeline/embeddings.ts
+
+  bytesPerToken:
+    value: 2.5
+    description: Bytes per token estimation factor for token budget checking
+    file: pipeline/embeddings.ts
+
+ingestion:
+  batchSizes:
+    unitsDefault:
+      value: 3
+      description: Default batch size for Phase 3 unit detection (rules/notes)
+      file: pipeline/ingest.ts, index.ts
+
+    unitsClientDefault:
+      value: 5
+      description: Default batch size when client doesn't specify (used in ingest script)
+      file: index.ts
+
+    summary:
+      value: 2
+      description: Batch size cap for Phase 4a summary generation (70b calls are expensive)
+      file: pipeline/ingest.ts
+
+    metadata:
+      value: 2
+      description: Batch size cap for Phase 4b metadata extraction (70b calls are expensive)
+      file: pipeline/ingest.ts
+
+    relations:
+      value: 1
+      description: >-
+        Relations are processed one at a time (each does multiple vector searches)
+      file: pipeline/ingest.ts
+
+    rebuildRelations:
+      value: 10
+      description: Default batch size for /ingest/rebuild-relations endpoint
+      file: pipeline/ingest.ts, index.ts
+
+  leafTypes:
+    value: [rule, table, note, image]
+    description: Structure node types that are processed as leaves in Phase 3
+    file: pipeline/ingest.ts
+
+parentContext:
+  maxChars:
+    value: 800
+    description: >-
+      Maximum characters of parent context included in summary and metadata prompts
+    file: pipeline/summary.ts, pipeline/metadata.ts
+
+fallbackSummaryLength:
+  value: 240
+  description: Character length of fallback summary (content slice) when LLM fails
+  file: pipeline/summary.ts, pipeline/relationships.ts
+
+orphanResolution:
+  boldHeadingMaxLength:
+    value: 60
+    description: Maximum length for a bold heading to be considered an orphan candidate
+    file: pipeline/units.ts
+
+  contentMaxLength:
+    value: 60
+    description: Maximum content length for a unit to be considered an orphan candidate
+    file: pipeline/units.ts
+
+  maxRetries:
+    value: 1
+    description: Retry count for orphan resolution LLM calls
+    file: pipeline/units.ts
+
+tableProcessing:
+  visualCollapseFillRatio:
+    value: 0.7
+    description: >-
+      Fill ratio threshold for visual collapse guard — below this, table may be
+      reclassified as visual
+    file: pipeline/table_tree.ts
+
+  sparseGridFillRatio:
+    value: 0.6
+    description: Fill ratio threshold for sparse wide grid detection
+    file: pipeline/table_tree.ts
+
+  sparseGridColumnCount:
+    value: 10
+    description: Column count threshold for sparse wide grid detection
+    file: pipeline/table_tree.ts
+
+  visualReclassificationMaxDataRows:
+    value: 2
+    description: Allow visual reclassification if table has this many or fewer data rows
+    file: pipeline/table_tree.ts
+
+  rowRefinementMaxRetries:
+    value: 0
+    description: Retry count for row refinement LLM calls
+    file: pipeline/table_tree.ts
+
+  columnTreeMaxRetries:
+    value: 0
+    description: Retry count for column tree detection LLM calls
+    file: pipeline/table_tree.ts
+
+relationshipExtraction:
+  similarityThreshold:
+    value: 0.5
+    description: Minimum vector similarity for a relationship match to be kept
+    file: pipeline/relationships.ts
+
+  vectorSearchTopK:
+    value: 100
+    description: Vector search topK per term probe during relationship extraction
+    file: pipeline/relationships.ts
+
+  minTermLength:
+    value: 1
+    description: Minimum term length (after trim) to be used as a relationship probe
+    file: pipeline/relationships.ts
+
+llm:
+  jsonTemperature:
+    value: 0
+    description: Temperature for JSON mode LLM calls (deterministic)
+    file: utils/llm.ts
+
+  textTemperature:
+    value: 0.2
+    description: Temperature for text generation LLM calls (low creativity)
+    file: utils/llm.ts
+
+  defaultMaxRetries:
+    value: 2
+    description: Default retry count for LLM calls
+    file: utils/llm.ts
+
+prompts:
+  summary:
+    description: System prompt for Phase 4a summary generation (70b)
+    file: pipeline/summary.ts
+    text: |-
+      You are a rules-analysis engine for a tabletop RPG rulebook (Russian language).
+      Given a single semantic unit, generate a short concise summary of what the unit says.
+
+      If a "Parent Unit" is provided, use it as context: the current unit is a child,
+      modifier, or sub-rule of that parent. Incorporate the parent's meaning into the
+      summary where relevant, so the summary is self-contained and meaningful even when
+      read without the parent.
+
+      Respond with ONLY a JSON object of the form:
+      {"summary": "one to three sentence plain-language summary of this unit"}
+
+      Keep the original language (Russian) for the summary.
+
+  metadata:
+    description: System prompt for Phase 4b metadata extraction (70b)
+    file: pipeline/metadata.ts
+    text: |-
+      You are a rules-analysis engine for a tabletop RPG rulebook (Russian language).
+      Given a single semantic unit and its pre-generated summary, extract structured metadata about it.
+
+      If a "Parent Unit" is provided, use it as context: the current unit is a child,
+      modifier, or sub-rule of that parent. Extract metadata that is explicitly present
+      in the current unit's own text or clearly implied by the parent-child relationship.
+
+      Extract all relationship fields. Each field is a list of named mechanics, terms, or
+      units that the current unit relates to in the specified way:
+      - defines: terms/mechanics this unit defines
+      - references: named mechanics/sections this unit mentions or points to
+      - requires: prerequisites for this unit to apply
+      - exceptions: exceptions to this unit's normal behavior
+      - modifies: mechanics this unit changes/affects
+      - modified_by: mechanics known to change/affect this unit, if stated
+      - overrides: mechanics whose rules this unit supersedes in specific cases
+      - related_to: mechanics related to this unit (generic association)
+      - incompatible_with: mechanics that cannot coexist with this unit
+      - creates: entities/conditions this unit brings into existence
+      - consumes: resources/entities this unit uses up
+      - supersedes: mechanics this unit entirely replaces
+      - example_of: broader categories this unit is an example of
+      - part_of: larger structures/categories this unit belongs to
+
+      Also extract:
+      - keywords: salient keywords for search
+      - aliases: alternate names/synonyms for this unit, if any
+
+      Respond with ONLY a JSON object with the fields above. All arrays contain strings.
+      Only use information present in the text. Use empty arrays where nothing applies.
+      Keep the original language (Russian) for all extracted strings.
+
+  orphanResolution:
+    description: >-
+      System prompt for Phase 3 orphan resolution (8b).
+      Template with ${node.type}, ${sectionPath}, ${node.content}, ${unitList}
+    file: pipeline/units.ts
+    text: |-
+      You are a rules-parsing engine for a tabletop RPG rulebook (Russian language).
+      Some of the detected semantic units below are "orphans": short fragments (e.g. stat modifiers like "+1З, +1Э", bonuses, penalties, exceptions, or conditions) that have no standalone meaning and clearly belong to a preceding unit.
+
+      For each orphan, decide whether to:
+      - "merge": combine its content into the preceding unit it belongs to.
+      - "link": keep it as a separate unit but mark it as a child of the preceding unit (use this when the fragment is a distinct related sub-rule, example, or exception worth keeping separately).
+
+      Only pick a "preceding" unit (parent_index < unit_index) from the list. If a unit makes sense on its own, do NOT include it.
+
+      Node type: ${node.type}
+      Section path: ${sectionPath}
+
+      Original text:
+      ${node.content}
+
+      Detected units:
+      ${unitList}
+
+      Respond with ONLY a JSON array of decisions, no prose, of the form:
+      [{"unit_index": 1, "action": "merge", "parent_index": 0, "reason": "it is the stat modifier for the age category"}]
+
+      Rules:
+      - Do not merge distinct list items, distinct spells, distinct weapons, or independent rules.
+      - Do not choose a parent that itself is being merged; if necessary, point to the final parent (the first non-merged unit in the chain).
+      - Preserve original language, case, and formatting.
+
+  tableRowRefinement:
+    description: >-
+      System prompt for table row classification refinement (70b).
+      Template with {{SKELETON}}, {{TABLE_CONTENT}}
+    file: pipeline/table_tree.ts
+    text: |-
+      You are reviewing a row classification for a Markdown table. The rows are prefixed with [N] (skip --- separator rows).
+
+      Current classification (deterministic skeleton):
+      {{SKELETON}}
+
+      Rules used by the skeleton:
+      - "structural": merged row (all cells identical). Could be a description, section header, or title.
+      - "header": non-merged row immediately before a --- separator (standard markdown table header).
+      - "data": all other rows (including rows after a --- separator when the pre-separator row was merged).
+      - Each data node has exactly 1 row. Parent links to the most recent structural/header node.
+
+      Review this classification and return ONLY corrections as a JSON array.
+
+      Correction types:
+      1. Reclassify a row's role:
+         {"row": <sourceRowIdx>, "new_role": "section"} — this row starts a new category; subsequent data should link to it
+         {"row": <sourceRowIdx>, "new_role": "description"} — this row is a description, not a section
+         {"row": <sourceRowIdx>, "new_role": "header"} — this row is a column header
+         {"row": <sourceRowIdx>, "new_role": "data"} — this row is regular data, not structural
+
+      2. Reparent a row (e.g. a description row should chain to the preceding name row):
+         {"row": <sourceRowIdx>, "new_parent": <sourceRowIdx>} — link this row to the specified row instead of its current parent
+
+         IMPORTANT: In many tables, rows alternate between NAMES (short, often with
+         parenthetical notes) and DESCRIPTIONS (longer text starting with a number,
+         "Пассивное", etc.). Chain each description row to the preceding name row:
+         {"row": <descRowIdx>, "new_parent": <nameRowIdx>}
+         This creates a parent→child hierarchy: name → description, so retrieving
+         a name also retrieves its description.
+
+      3. Reclassify the entire table as visual (grid/diagram, NOT a data table):
+         {"action": "visual"}
+         Only use this for tables that are NOT real data tables (e.g. layout grids,
+         decorative formatting, diagrams). If the table has multiple data rows with
+         meaningful content, do NOT use "visual".
+
+      Rules:
+      - Do NOT drop any rows. Every row must remain in the tree.
+      - Do NOT create multiple roots. Only the first node can have parent: null.
+      - "new_parent" must reference a row that appears BEFORE the current row in the table.
+      - If the classification is correct, return: []
+
+      Return ONLY a JSON array of corrections: []
+
+      Table:
+      {{TABLE_CONTENT}}
+
+  tableColumnTree:
+    description: >-
+      System prompt for table column tree detection (70b).
+      Template with {{ROW_SKELETON}}, {{TABLE_CONTENT}}
+    file: pipeline/table_tree.ts
+    text: |-
+      Analyze the columns of this Markdown table and build a column tree as JSON.
+
+      The row structure has already been classified:
+      {{ROW_SKELETON}}
+
+      COLUMN TREE node types:
+      - "header": a column header. "cols" lists which 0-based column indices it covers.
+      - "data": a column group. "cols" lists which columns belong to this group.
+      - "visual": one node covering all columns.
+      Each node: {"id","type","cols":[...],"parent":id or null}
+      Data nodes should have "parent" pointing to the column header node they belong to.
+
+      KEY DECISION: Are columns PROPERTIES of one entity, or INDEPENDENT sub-tables?
+
+      SPLIT (independent sub-tables side by side) — each column or column-group is a
+      separate list. Data in one column is NOT a property of the other column.
+        - Disadvantages | Advantages (two unrelated lists)
+        - Weapon A stats | Weapon B stats (two separate weapons)
+        - Cost | Effect | Cost | Effect (two separate price lists)
+        - Key | Value | Key | Value (two key-value pair groups side by side)
+        - Merged title row + independent item lists in each column
+          (e.g. "Perks" | "Perks" title, then col 0 = items 1-6, col 1 = items 7-12)
+        - Spell names in col 0 | Spell names in col 1 (two independent spell lists,
+          data rows alternate between names and descriptions)
+      → Create one "data" node per column-group, each with "parent" pointing to its header.
+        Keep key-value pairs TOGETHER in one data node (e.g. cols:[0,1] not cols:[0] and cols:[1]).
+        A merged title row (all cells identical) does NOT mean columns are related —
+        check the DATA rows to decide if columns are independent.
+
+      SIMPLE (properties of one entity) — columns describe attributes of the same row.
+        - Attr | Value | Cost (one item per row, columns are its properties)
+        - Name | Description | Price (one entity per row)
+        - Key | Value (one key-value pair per row, both columns describe the same entity)
+        - Level | Property1 | Property2 | Property3 (one level per row, all columns
+          describe that level's attributes)
+      → Create ONE "data" node with ALL columns, parent=null.
+
+      HOW TO DECIDE: Look at the DATA rows, not just the header.
+        - If col 0 contains sequential keys (0, 1, 2, ...) and other columns describe
+          properties of each key → SIMPLE (all columns describe the same entity).
+        - If each column contains its own independent list of items (names, descriptions,
+          or values that don't reference each other) → SPLIT.
+        - If data rows alternate between short names and long descriptions in each column
+          independently → SPLIT (each column is its own name→description list).
+
+      EXAMPLE — SPLIT (2 columns, independent lists):
+      [0]|Disadvantages|Advantages|
+      column_tree: [{"id":0,"type":"header","cols":[0],"parent":null},{"id":1,"type":"header","cols":[1],"parent":null},{"id":2,"type":"data","cols":[0],"parent":0},{"id":3,"type":"data","cols":[1],"parent":1}]
+
+      EXAMPLE — SPLIT (2 columns, merged title + independent numbered lists):
+      [0]|Perks|Perks|
+      [2]|1) Item A|7) Item G|
+      [3]|2) Item B|8) Item H|
+      column_tree: [{"id":0,"type":"header","cols":[0],"parent":null},{"id":1,"type":"header","cols":[1],"parent":null},{"id":2,"type":"data","cols":[0],"parent":0},{"id":3,"type":"data","cols":[1],"parent":1}]
+      Note: The merged title row "Perks|Perks" is just a section label. The data rows
+      have INDEPENDENT numbered lists (1-6 in col 0, 7-12 in col 1) → SPLIT, not SIMPLE.
+
+      EXAMPLE — SPLIT (4 columns, key-value pairs side by side):
+      [0]|Key1|Value1|Key2|Value2|
+      column_tree: [{"id":0,"type":"header","cols":[0,1],"parent":null},{"id":1,"type":"header","cols":[2,3],"parent":null},{"id":2,"type":"data","cols":[0,1],"parent":0},{"id":3,"type":"data","cols":[2,3],"parent":1}]
+
+      EXAMPLE — SPLIT (4 columns, paired):
+      [0]|WeaponA|WeaponA|WeaponB|WeaponB|
+      column_tree: [{"id":0,"type":"header","cols":[0],"parent":null},{"id":1,"type":"header","cols":[1],"parent":null},{"id":2,"type":"header","cols":[2],"parent":null},{"id":3,"type":"header","cols":[3],"parent":null},{"id":4,"type":"data","cols":[0,1],"parent":0},{"id":5,"type":"data","cols":[2,3],"parent":2}]
+
+      EXAMPLE — SIMPLE (multi-property):
+      [0]|Attr|Value|Cost|
+      column_tree: [{"id":0,"type":"data","cols":[0,1,2],"parent":null}]
+
+      Return ONLY JSON: {"column_tree":[...],"reason":"..."}
+
+      Table:
+      {{TABLE_CONTENT}}

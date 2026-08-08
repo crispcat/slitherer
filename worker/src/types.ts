@@ -67,7 +67,7 @@ export interface SemanticUnit {
   summary?: string;
   metadata?: UnitMetadata;
   embeddingId?: string;
-  status: "pending" | "metadata_done" | "relations_done" | "embedded" | "graphed";
+  status: "pending" | "summary_done" | "metadata_done" | "relations_done" | "done";
   updatedAt: string;
 }
 
@@ -79,12 +79,16 @@ export interface UnitMetadata {
   exceptions: string[];
   modifies: string[];
   modified_by: string[];
+  overrides: string[];
+  related_to: string[];
+  incompatible_with: string[];
+  creates: string[];
+  consumes: string[];
+  supersedes: string[];
+  example_of: string[];
+  part_of: string[];
   keywords: string[];
   aliases: string[];
-  summary: string;
-  /** Reference-like strings extracted from metadata that could not be resolved
-   *  to any candidate unit. Stored for downstream reporting and iterative cleanup. */
-  unresolved_references?: string[];
 }
 
 // ---- Phase 5: relationships ----
@@ -121,8 +125,52 @@ export interface Citation {
   page: number;
 }
 
+export interface ConversationMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface RouterResult {
+  rag: boolean;
+  language: string;
+  russianQuery: string;
+  /** Present when rag=false — the direct chat response. */
+  chatResponse?: string;
+}
+
+export interface DecomposeResult {
+  subQueries: string[];
+  /** Dynamic rerank threshold — precise questions get higher (0.4-0.5),
+   *  exploratory questions get lower (0.2-0.3). */
+  rerankThreshold: number;
+}
+
+export interface SufficiencyResult {
+  sufficient: boolean;
+  gaps: string[];
+  followUpQueries: string[];
+}
+
 export interface QueryResult {
   answer: string;
   citations: Citation[];
   usedUnitIds: string[];
+  language: string;
+  /** Debug info — only returned when debug=true. */
+  debug?: QueryDebug;
+}
+
+export interface QueryDebug {
+  router: RouterResult;
+  decomposition: DecomposeResult;
+  iterations: IterationDebug[];
+  finalEvidenceCount: number;
+}
+
+export interface IterationDebug {
+  iteration: number;
+  subQueries: string[];
+  candidatesFound: number;
+  afterRerank: number;
+  sufficiency?: SufficiencyResult;
 }

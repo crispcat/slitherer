@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Slitherer RAG</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Login gate: shown until API token is verified -->
+  <div id="login-screen" class="login-screen">
+    <div class="login-card">
+      <h1>Slitherer RAG</h1>
+      <p class="login-subtitle">Enter your API token to continue</p>
+      <form id="login-form" class="login-form">
+        <div class="login-field">
+          <label for="login-token">API Token</label>
+          <input type="password" id="login-token" placeholder="Bearer token" required autocomplete="off" />
+        </div>
+        <button type="submit" id="login-btn" class="btn-primary">Connect</button>
+        <div id="login-error" class="login-error hidden"></div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Main app: hidden until authenticated -->
+  <div id="app" class="hidden">
+    <!-- Sidebar: parameter controls -->
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <h1>Slitherer RAG</h1>
+        <button id="new-chat-btn" class="btn-secondary" title="New chat">+ New Chat</button>
+      </div>
+
+      <div class="param-group">
+        <label class="param-label">Request Mode</label>
+        <select id="param-mode" class="param-select">
+          <option value="staged" selected>Staged (step-by-step)</option>
+          <option value="full">Full (all-in-one /query)</option>
+        </select>
+      </div>
+
+      <div class="param-group">
+        <label class="param-toggle">
+          <input type="checkbox" id="param-stream" checked />
+          <span>Stream tokens (SSE)</span>
+        </label>
+      </div>
+
+      <div class="param-group">
+        <label class="param-toggle">
+          <input type="checkbox" id="param-debug" checked />
+          <span>Show debug info</span>
+        </label>
+      </div>
+
+      <div class="param-group">
+        <label class="param-label">Semantical Net Width: <span id="graph-hops-val">2</span></label>
+        <input type="range" id="param-graph-hops" min="0" max="4" value="2" step="1" class="param-range" />
+      </div>
+
+      <div class="param-group">
+        <label class="param-label">Thinking Level: <span id="max-iterations-val">3</span></label>
+        <input type="range" id="param-max-iterations" min="1" max="5" value="3" step="1" class="param-range" />
+      </div>
+
+      <div class="sidebar-footer">
+        <span id="connection-status" class="status-dot status-unknown">●</span>
+        <span id="connection-text">Not connected</span>
+        <button id="logout-btn" class="btn-secondary" title="Logout">Logout</button>
+      </div>
+    </aside>
+
+    <!-- Main chat area -->
+    <main id="chat-area">
+      <!-- Tab bar -->
+      <div id="tab-bar" class="tab-bar"></div>
+
+      <!-- Chat container (messages get rendered here per-tab) -->
+      <div id="messages" class="messages">
+        <div class="welcome-message">
+          <h2>Slitherer RAG</h2>
+          <p>Ask questions about tabletop RPG rules. The system will route, decompose, retrieve, and iterate to find the best answer.</p>
+          <p class="hint">Try: "Как работает оглушение?" or "What are the combat modifiers?"</p>
+        </div>
+      </div>
+
+      <div id="input-area" class="input-area">
+        <div class="input-wrapper">
+          <textarea id="message-input" class="message-input" placeholder="Ask a question..." rows="1"></textarea>
+          <button id="send-btn" class="btn-primary" title="Send">Send</button>
+          <button id="stop-btn" class="btn-stop hidden" title="Stop">Stop</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="api.js"></script>
+  <script src="ui.js"></script>
+</body>
+</html>
