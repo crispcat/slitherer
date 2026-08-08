@@ -95,6 +95,31 @@
     </main>
   </div>
 
+  <script src="config.js"></script>
+  <script>
+    // Apply UI defaults from config (config.js sets PAGES_CONFIG)
+    (function() {
+      const ui = (typeof PAGES_CONFIG !== "undefined" && PAGES_CONFIG.client?.ui) || {};
+      const mode = document.getElementById("param-mode");
+      if (mode && ui.defaultRequestMode) mode.value = ui.defaultRequestMode;
+      const stream = document.getElementById("param-stream");
+      if (stream && ui.defaultStream !== undefined) stream.checked = ui.defaultStream;
+      const debug = document.getElementById("param-debug");
+      if (debug && ui.defaultDebug !== undefined) debug.checked = ui.defaultDebug;
+      const hops = document.getElementById("param-graph-hops");
+      if (hops && ui.defaultGraphHops !== undefined) {
+        hops.value = ui.defaultGraphHops;
+        const hopsVal = document.getElementById("graph-hops-val");
+        if (hopsVal) hopsVal.textContent = ui.defaultGraphHops;
+      }
+      const iter = document.getElementById("param-max-iterations");
+      if (iter && ui.defaultMaxIterations !== undefined) {
+        iter.value = ui.defaultMaxIterations;
+        const iterVal = document.getElementById("max-iterations-val");
+        if (iterVal) iterVal.textContent = ui.defaultMaxIterations;
+      }
+    })();
+  </script>
   <script src="api.js"></script>
   <script src="ui.js"></script>
 </body>

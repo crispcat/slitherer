@@ -10,7 +10,7 @@
  *
  * Usage:
  *   node scripts/ingest.mjs \
- *     --url https://slitherer-rag.<subdomain>.workers.dev \
+ *     --url https://api.slitherer.workers.dev \
  *     --structure ../rulebooks/deorim_rules.structure.json \
  *     --document-id deorim_rules \
  *     --source-path rulebooks/deorim_rules.docx
@@ -20,16 +20,37 @@
  *   node scripts/ingest.mjs --stage metadata
  *   node scripts/ingest.mjs --stage relations
  *
+ *   # Re-parse + re-run units from scratch:
+ *   node scripts/ingest.mjs --stage units
+ *
+ * When --stage units is used, the script first re-parses the rulebook to
+ * regenerate structure.json, then uploads it and creates a fresh job.
+ * Other stages resume from the existing state file.
+ *
  * Re-running with the same --state file resumes an in-progress or failed job.
  */
 
 import { readFile, writeFile, appendFile, access } from "node:fs/promises";
-import { resolve } from "node:path";
+import { readFileSync, existsSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { resolve, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import * as yaml from "js-yaml";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const WORKER_DIR = resolve(__dirname, "..");
+const REPO_DIR = resolve(WORKER_DIR, "..");
+
+// Read base URL from config/worker.yaml
+const workerConfig = yaml.load(readFileSync(join(REPO_DIR, "config", "worker.yaml"), "utf8"));
+const DEFAULT_WORKER_URL = workerConfig.url;
 
 function parseArgs(argv) {
   const args = {
     url: null,
     structure: "../rulebooks/deorim_rules.structure.json",
+    rulebook: null, // derived from --structure if not set
+    docx: null, // derived from --rulebook if not set
     documentId: "deorim_rules",
     sourcePath: "rulebooks/deorim_rules.docx",
     batchSize: 5,
@@ -48,6 +69,8 @@ function parseArgs(argv) {
     switch (a) {
       case "--url": args.url = next(); break;
       case "--structure": args.structure = next(); break;
+      case "--rulebook": args.rulebook = next(); break;
+      case "--docx": args.docx = next(); break;
       case "--document-id": args.documentId = next(); break;
       case "--source-path": args.sourcePath = next(); break;
       case "--batch-size": args.batchSize = parseInt(next(), 10); break;
@@ -64,12 +87,28 @@ function parseArgs(argv) {
         process.exit(1);
     }
   }
+  // Derive rulebook path from structure path if not explicitly set
+  if (!args.rulebook) {
+    args.rulebook = args.structure.replace(/\.structure\.json$/, ".md");
+  }
+  // Derive docx path from rulebook path if not explicitly set
+  if (!args.docx) {
+    args.docx = args.rulebook.replace(/\.md$/, ".docx");
+  }
   if (!args.url) {
-    console.error("Missing required --url <worker base url>");
-    process.exit(1);
+    args.url = DEFAULT_WORKER_URL;
+  }
+  // Read API key from .dev.vars as fallback
+  if (!args.apiKey) {
+    const devVarsPath = join(WORKER_DIR, ".dev.vars");
+    if (existsSync(devVarsPath)) {
+      const devVars = readFileSync(devVarsPath, "utf8");
+      const match = devVars.match(/^ADMIN_API_KEY=(.+)$/m);
+      if (match) args.apiKey = match[1].trim();
+    }
   }
   if (!args.apiKey) {
-    console.error("Missing admin API key. Pass --api-key <key> or set ADMIN_API_KEY env var.");
+    console.error("Missing admin API key. Pass --api-key <key>, set ADMIN_API_KEY env var, or put it in worker/.dev.vars.");
     process.exit(1);
   }
   const VALID_STAGES = ["units", "summary", "metadata", "relations"];
@@ -201,6 +240,40 @@ function sleep(ms) {
 async function main() {
   await log("INFO", "Ingestion run starting", { url: args.url, stage: args.stage ?? "all" });
 
+  // When --stage units, force fresh: re-parse the document, upload, and create a new job.
+  // The units phase needs the latest structure.json, and reset-stage for units deletes
+  // the old job, so we need a fresh one anyway.
+  if (args.stage === "units") {
+    args.fresh = true;
+    const docxPath = resolve(process.cwd(), args.docx);
+    const rulebookPath = resolve(process.cwd(), args.rulebook);
+    const structurePath = resolve(process.cwd(), args.structure);
+    const docxParserPath = join(REPO_DIR, "parser", "docx_to_markdown.py");
+    const mdParserPath = join(REPO_DIR, "parser", "markdown_to_structure.py");
+    const venvPython = join(REPO_DIR, "parser", ".venv", "bin", "python");
+    await log("STAGE", "Re-parsing rulebook (--stage units)", { docx: docxPath, rulebook: rulebookPath, structure: structurePath });
+    // Stage 1: DOCX -> Markdown
+    execSync(`"${venvPython}" "${docxParserPath}" "${docxPath}" -o "${rulebookPath}"`, {
+      stdio: "inherit",
+      cwd: REPO_DIR,
+    });
+    // Stage 2: Markdown -> structure.json
+    execSync(`"${venvPython}" "${mdParserPath}" "${rulebookPath}" -o "${structurePath}"`, {
+      stdio: "inherit",
+      cwd: REPO_DIR,
+    });
+    await log("STAGE", "Re-parse complete");
+
+    // Clear old ingestion data (semantic_units, embeddings, relations, concepts, keywords).
+    // reset-stage for units does a full wipe — we need this before creating a fresh job.
+    await log("STAGE", "Resetting stage 'units' to clean state", { documentId: args.documentId });
+    const resetResult = await withRetry(
+      () => postJson("/ingest/reset-stage", { documentId: args.documentId, stage: "units" }),
+      "POST /ingest/reset-stage"
+    );
+    await log("STAGE", "Stage reset complete", resetResult);
+  }
+
   let state = args.fresh ? null : await loadState();
 
   if (args.statusOnly) {
@@ -260,9 +333,10 @@ async function main() {
     await log("STAGE", "Resuming existing ingestion job from state file", state);
   }
 
-  // If --stage is specified, reset that stage to a clean state before running.
+  // If --stage is specified (and not units, which already starts fresh),
+  // reset that stage to a clean state before running.
   // This clears the stage's outputs and all downstream stages' outputs.
-  if (args.stage) {
+  if (args.stage && args.stage !== "units") {
     await log("STAGE", `Resetting stage '${args.stage}' to clean state`, { documentId: args.documentId });
     const resetResult = await withRetry(
       () => postJson("/ingest/reset-stage", { documentId: args.documentId, stage: args.stage }),

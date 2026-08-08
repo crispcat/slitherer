@@ -137,6 +137,24 @@ tableProcessing:
     description: Retry count for column tree detection LLM calls
     file: pipeline/table_tree.ts
 
+  prevRuleLinkingMaxRetries:
+    value: 0
+    description: Retry count for prev-rule linking LLM calls
+    file: pipeline/table_tree.ts
+
+  prevRuleContentMaxChars:
+    value: 800
+    description: Maximum characters of previous rule content sent to the linking LLM
+    file: pipeline/table_tree.ts
+
+  prevRuleTablePreviewRows:
+    value: 10
+    description: >-
+      Number of table rows (including header/separator) sent to the linking LLM.
+      Only the first N rows are needed to judge whether the table belongs to the
+      previous rule — the full table is not sent.
+    file: pipeline/table_tree.ts
+
 relationshipExtraction:
   similarityThreshold:
     value: 0.5
@@ -297,6 +315,38 @@ prompts:
          decorative formatting, diagrams). If the table has multiple data rows with
          meaningful content, do NOT use "visual".
 
+      PSEUDO-HEADER DETECTION (critical, apply FIRST before any other analysis):
+      In Markdown, the row before the --- separator is ALWAYS classified as "header"
+      by the deterministic skeleton. However, many tables have NO real header — the
+      first row is just the first data row, and the --- is merely a Markdown formatting
+      requirement. A pseudo-header is a pre-separator row that:
+      - Has the same number of columns as the data rows after the separator
+      - Contains the same TYPE of content as the data rows (not column names/labels)
+      - Does not stand out as a title or category label
+
+      MANDATORY CHECK: Compare the pre-separator row to the post-separator data rows.
+      If the pre-separator row has the SAME number of columns AND contains the same
+      kind of content (e.g. values, names, numbers — not column labels like "Name",
+      "Value", "Description"), you MUST reclassify it as "data":
+      {"row": <idx>, "new_role": "data"}
+
+      Key-value lookup tables (no column headers, just paired values):
+        [0]| Value 1 | Weak | Value 4 | Exceptional |    ← classified as "header", but it's DATA
+        [1]| --- | --- | --- | --- |                      ← separator
+        [2]| Value 2 | Average | Value 5 | Extraordinary |← data
+        [3]| Value 3 | Noticeable | Value 6 | Incredible |← data
+      Correction: [{"row": 0, "new_role": "data"}]
+
+      Another example (Russian, same pattern):
+        [0]| Значение 1 | Слабый | Значение 4 | Выдающийся |  ← classified as "header", but it's DATA
+        [1]| --- | --- | --- | --- |                            ← separator
+        [2]| Значение 2 | Средний | Значение 5 | Исключительный |← data
+        [3]| Значение 3 | Заметный | Значение 6 | Невероятный |  ← data
+      Correction: [{"row": 0, "new_role": "data"}]
+
+      If you find a pseudo-header, return the correction IMMEDIATELY. Do NOT return []
+      when a pseudo-header is present.
+
       Rules:
       - Do NOT drop any rows. Every row must remain in the tree.
       - Do NOT create multiple roots. Only the first node can have parent: null.
@@ -387,3 +437,34 @@ prompts:
 
       Table:
       {{TABLE_CONTENT}}
+
+  tablePrevRuleLinking:
+    description: >-
+      System prompt for deciding whether a table belongs to the preceding rule (70b).
+      Template with {{PREVIOUS_RULE_CONTENT}}, {{TABLE_CONTENT}}
+    file: pipeline/table_tree.ts
+    text: |-
+      You are analyzing a table from a tabletop RPG rulebook. Decide whether this table
+      is a reference or lookup table that belongs to the preceding rule — i.e., the table
+      has no standalone meaning and is just data that elaborates the previous rule.
+
+      Previous rule content:
+      {{PREVIOUS_RULE_CONTENT}}
+
+      Table content (first few rows only — the full table may be longer):
+      {{TABLE_CONTENT}}
+
+      Respond with ONLY a JSON object: {"link": true, "reason": "..."} or {"link": false, "reason": "..."}
+
+      Link to the previous rule (link: true) if ALL of these are true:
+      - The table has no clear header, title, or description row (no merged description,
+        no column names that label the table as a standalone entity)
+      - The table is a simple key-value lookup, reference, or data table
+      - The table's content is directly related to the previous rule's topic (e.g. the
+        rule describes attributes and the table lists attribute value meanings)
+
+      Do NOT link (link: false) if ANY of these are true:
+      - The table has its own header, title, merged description, or section label
+      - The table is an independent entity (a separate list of items, spells, weapons, etc.)
+      - The table's content is unrelated to the previous rule
+      - The previous rule is too short or generic to be a meaningful parent

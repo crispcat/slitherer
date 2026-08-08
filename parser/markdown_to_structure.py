@@ -68,7 +68,9 @@ MAX_TABLE_CHARS = 4000
 MAX_RULE_CHARS = 4000
 
 # Pseudo-level for group nodes on the heading stack. Higher than any real
-# heading level (1-6) so that any new heading pops the group off the stack.
+# heading level (1-6) so that any new heading pops all groups off the stack.
+# Nested groups get incrementing levels (GROUP_LEVEL, GROUP_LEVEL+1, ...) so
+# a child group is deeper than its parent group on the stack.
 GROUP_LEVEL = 99
 
 
@@ -279,13 +281,32 @@ def parse(markdown_text: str) -> dict:
         # tree an explicit category → entries hierarchy. This prevents short
         # category labels from becoming orphan units and stops later category
         # labels from bleeding into the last entry of the previous group.
-        if text.endswith((":")) and not is_rule_start:
+        # A ":"-ending line whose next non-empty line is a list item becomes a
+        # group node, regardless of whether the label itself is bold/numbered.
+        # The key signal is the trailing ":" + list-following, not the format
+        # of the label. Bold entries like "**Аврианцы.**" end with "." not ":"
+        # so they won't be caught.
+        # Strip trailing bold markers (** or ***) before checking for ":".
+        _stripped_text = text.rstrip("*")
+        if _stripped_text.endswith(":"):
             next_text = _peek_next_non_empty(lines, i + 1)
             if next_text is not None and _is_list_start(next_text):
-                # Pop any existing group (groups are siblings, not nested).
-                while heading_stack and heading_stack[-1][0] >= GROUP_LEVEL:
-                    heading_stack.pop()
-                group_parent = heading_stack[-1][1]
+                # Determine the group's parent. If we're currently inside a
+                # group and this ":"-ending line is itself a list item (bold,
+                # numbered, or bullet), it's a sub-category → nest as a child
+                # of the current group. Otherwise, pop back to the heading
+                # level (siblings, not nested).
+                in_group = heading_stack and heading_stack[-1][0] >= GROUP_LEVEL
+                if in_group and is_numbered_or_bullet:
+                    # Nested group: child of the current (innermost) group.
+                    group_parent = heading_stack[-1][1]
+                    group_level = heading_stack[-1][0] + 1
+                else:
+                    # Sibling group: pop back to the last non-group heading.
+                    while heading_stack and heading_stack[-1][0] >= GROUP_LEVEL:
+                        heading_stack.pop()
+                    group_parent = heading_stack[-1][1]
+                    group_level = GROUP_LEVEL
 
                 # Always create a new group node. The previous leaf (if any)
                 # stays as a rule under its original parent — we never convert
@@ -311,7 +332,7 @@ def parse(markdown_text: str) -> dict:
                 new_path.append(group_title[:80])
                 nodes[group_id].path = new_path
 
-                heading_stack.append((GROUP_LEVEL, group_id))
+                heading_stack.append((group_level, group_id))
                 path_titles = new_path
                 current_leaf_id = None
                 in_list_after_intro = False

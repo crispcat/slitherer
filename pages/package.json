@@ -1,0 +1,15 @@
+{
+  "name": "slitherer-pages",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "gen-config": "node scripts/gen-config.mjs",
+    "deploy:client": "npm run gen-config && wrangler deploy --config client/wrangler.toml",
+    "deploy:debug": "npm run gen-config && wrangler deploy --config debug/wrangler.toml",
+    "deploy:all": "npm run gen-config && npm run deploy:client && npm run deploy:debug"
+  },
+  "devDependencies": {
+    "js-yaml": "^5.2.3",
+    "wrangler": "^3.90.0"
+  }
+}

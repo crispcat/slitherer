@@ -1,0 +1,7 @@
+name = "client"
+compatibility_date = "2024-09-01"
+
+[assets]
+directory = "."
+not_found_handling = "single-page-application"
+exclude = ["wrangler.toml"]

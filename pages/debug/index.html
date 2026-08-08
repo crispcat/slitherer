@@ -1,0 +1,1194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Slitherer — Unit Tree Viewer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; }
+
+  /* Login gate */
+  .login-screen { position: fixed; inset: 0; background: #1a1a2e; display: flex; align-items: center; justify-content: center; z-index: 100; }
+  .login-screen.hidden { display: none; }
+  .login-card { background: #16213e; border: 1px solid #0f3460; border-radius: 12px; padding: 32px; width: 380px; max-width: 90vw; }
+  .login-card h1 { color: #e94560; font-size: 22px; margin-bottom: 8px; }
+  .login-card .subtitle { color: #a0a0b0; font-size: 14px; margin-bottom: 24px; }
+  .login-field { margin-bottom: 16px; }
+  .login-field label { display: block; font-size: 13px; color: #a0a0b0; margin-bottom: 6px; }
+  .login-field input { width: 100%; background: #0f3460; border: 1px solid #1a1a4e; color: #e0e0e0; padding: 10px 14px; border-radius: 6px; font-size: 14px; }
+  .login-field input:focus { outline: none; border-color: #e94560; }
+  .login-btn { width: 100%; background: #e94560; border: none; color: #fff; padding: 12px; border-radius: 6px; font-size: 14px; cursor: pointer; font-weight: 600; }
+  .login-btn:hover { background: #c81e4a; }
+  .login-btn:disabled { opacity: 0.6; cursor: wait; }
+  .login-error { color: #e94560; font-size: 13px; margin-top: 12px; display: none; }
+  .login-error.visible { display: block; }
+
+  /* Main app */
+  #app.hidden { display: none; }
+  #controls { position: fixed; top: 0; left: 0; right: 0; padding: 12px 20px; background: #16213e; border-bottom: 1px solid #0f3460; z-index: 10; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  #controls label { font-size: 13px; color: #a0a0b0; }
+  #controls input, #controls select, #controls button { background: #0f3460; border: 1px solid #1a1a4e; color: #e0e0e0; padding: 6px 12px; border-radius: 4px; font-size: 13px; }
+  #controls button { cursor: pointer; }
+  #controls button:hover { background: #1a1a5e; }
+  #controls button.danger { border-color: #e94560; color: #e94560; }
+  #controls button.danger:hover { background: #e94560; color: #fff; }
+  #controls input[type="text"] { width: 250px; }
+  #controls select { max-width: 200px; }
+  #status { font-size: 12px; color: #a0a0b0; margin-left: auto; }
+  #tree-container { margin-top: 60px; width: 100%; height: calc(100vh - 60px); overflow: auto; }
+  svg { width: 100%; min-height: 100%; display: block; }
+  .node circle { fill: #e94560; stroke: #fff; stroke-width: 1.5px; cursor: pointer; }
+  .node.collapsed circle { fill: #0f3460; stroke: #e94560; }
+  .node.has-comment circle { stroke: #f9a825; stroke-width: 3px; }
+  .node text { font-size: 11px; fill: #e0e0e0; pointer-events: none; }
+  .node text.comment-badge { fill: #f9a825; font-weight: bold; font-size: 14px; pointer-events: none; }
+  .link { fill: none; stroke: #0f3460; stroke-width: 1.5px; }
+  .node-tooltip { position: fixed; background: #16213e; border: 1px solid #0f3460; padding: 10px 14px; border-radius: 6px; font-size: 12px; max-width: 400px; pointer-events: none; z-index: 20; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+  .node-tooltip strong { color: #e94560; }
+  .node-tooltip .meta { color: #a0a0b0; margin-top: 4px; }
+  .node-tooltip .comment { color: #f9a825; margin-top: 6px; padding-top: 6px; border-top: 1px solid #0f3460; }
+  .node-tooltip .unit-content { color: #c8c8d0; margin-top: 6px; padding-top: 6px; border-top: 1px solid #0f3460; white-space: pre-wrap; max-height: 200px; overflow-y: auto; font-size: 12px; line-height: 1.4; }
+  .legend { position: fixed; bottom: 12px; right: 12px; background: #16213e; border: 1px solid #0f3460; padding: 10px 14px; border-radius: 6px; font-size: 12px; z-index: 10; }
+  .legend-item { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  .legend-dot { width: 12px; height: 12px; border-radius: 50%; }
+
+  /* Side panel */
+  .side-panel { position: fixed; top: 0; right: 0; width: 450px; max-width: 90vw; height: 100vh; background: #16213e; border-left: 1px solid #0f3460; z-index: 25; display: none; flex-direction: column; box-shadow: -4px 0 12px rgba(0,0,0,0.4); overflow: hidden; }
+  .side-panel.open { display: flex; }
+  .side-panel-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid #0f3460; flex-shrink: 0; }
+  .side-panel-header h2 { font-size: 16px; color: #e94560; margin: 0; }
+  .side-panel-header button { background: none; border: none; color: #a0a0b0; font-size: 22px; cursor: pointer; padding: 0 4px; line-height: 1; }
+  .side-panel-header button:hover { color: #e94560; }
+  #side-panel-body { flex: 1; overflow-y: auto; padding: 16px 18px; font-size: 13px; line-height: 1.5; }
+  .sp-section { margin-bottom: 18px; }
+  .sp-section-title { color: #e94560; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; border-bottom: 1px solid #0f3460; padding-bottom: 4px; }
+  .sp-field { display: flex; gap: 8px; margin: 4px 0; }
+  .sp-field-label { color: #a0a0b0; min-width: 110px; flex-shrink: 0; }
+  .sp-field-value { color: #e0e0e0; word-break: break-word; }
+  .sp-content { background: #0f3460; border: 1px solid #1a1a4e; border-radius: 4px; padding: 10px 12px; white-space: pre-wrap; font-size: 12px; line-height: 1.5; max-height: 300px; overflow-y: auto; }
+  .sp-summary { background: #0f3460; border: 1px solid #1a1a4e; border-radius: 4px; padding: 10px 12px; font-size: 12px; line-height: 1.5; }
+  .sp-tag { display: inline-block; background: #0f3460; border: 1px solid #1a1a4e; border-radius: 3px; padding: 2px 8px; margin: 2px 4px 2px 0; font-size: 11px; color: #c8c8d0; }
+  .sp-rel-item { padding: 6px 10px; margin: 4px 0; background: #0f3460; border: 1px solid #1a1a4e; border-radius: 4px; font-size: 12px; }
+  .sp-rel-type { color: #f9a825; font-weight: bold; }
+  .sp-rel-target { color: #c8c8d0; }
+  .sp-loading { text-align: center; padding: 40px; color: #a0a0b0; }
+
+  /* Comment modal */
+  #comment-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 30; display: none; align-items: center; justify-content: center; }
+  #comment-modal .modal { background: #16213e; border: 1px solid #0f3460; border-radius: 8px; padding: 20px; width: 500px; max-width: 90vw; }
+  #comment-modal h3 { color: #e94560; margin-bottom: 12px; }
+  #comment-modal .node-info { font-size: 12px; color: #a0a0b0; margin-bottom: 12px; }
+  #comment-modal textarea { width: 100%; height: 120px; background: #0f3460; border: 1px solid #1a1a4e; color: #e0e0e0; padding: 10px; border-radius: 4px; font-size: 13px; font-family: inherit; resize: vertical; }
+  #comment-modal .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 12px; }
+  #comment-modal button { background: #0f3460; border: 1px solid #1a1a4e; color: #e0e0e0; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  #comment-modal button:hover { background: #1a1a5e; }
+  #comment-modal button.danger { border-color: #e94560; color: #e94560; }
+  #comment-modal button.danger:hover { background: #e94560; color: #fff; }
+
+  /* Context menu */
+  #context-menu { position: fixed; background: #16213e; border: 1px solid #0f3460; border-radius: 6px; padding: 6px 0; z-index: 25; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.4); min-width: 160px; }
+  #context-menu .item { padding: 8px 16px; cursor: pointer; font-size: 13px; }
+  #context-menu .item:hover { background: #0f3460; }
+  #context-menu .item.delete { color: #e94560; }
+
+  /* Debug log panel */
+  #debug-panel { position: fixed; bottom: 0; left: 0; right: 0; background: #16213e; border-top: 1px solid #0f3460; z-index: 20; display: flex; flex-direction: column; transition: height 0.2s ease; height: 0; overflow: hidden; }
+  #debug-panel.open { height: 280px; }
+  #debug-panel-header { display: flex; align-items: center; gap: 10px; padding: 6px 14px; background: #0f3460; border-bottom: 1px solid #1a1a4e; flex-shrink: 0; }
+  #debug-panel-header .title { font-size: 12px; color: #e94560; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+  #debug-panel-header .count { font-size: 11px; color: #a0a0b0; }
+  #debug-panel-header .spacer { flex: 1; }
+  #debug-panel-header button { background: #1a1a4e; border: 1px solid #1a1a4e; color: #e0e0e0; padding: 3px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; }
+  #debug-panel-header button:hover { background: #1a1a5e; }
+  #debug-panel-header button.danger { border-color: #e94560; color: #e94560; }
+  #debug-panel-header button.danger:hover { background: #e94560; color: #fff; }
+  #debug-log-list { flex: 1; overflow-y: auto; padding: 4px 14px; font-family: "SF Mono", "Fira Code", "Consolas", monospace; font-size: 11px; line-height: 1.6; }
+  .log-entry { display: flex; gap: 8px; padding: 1px 0; }
+  .log-time { color: #6a6a8a; flex-shrink: 0; white-space: nowrap; }
+  .log-level { flex-shrink: 0; width: 42px; text-transform: uppercase; font-weight: 600; }
+  .log-level.info { color: #4e9eff; }
+  .log-level.warn { color: #f9a825; }
+  .log-level.error { color: #e94560; }
+  .log-source { color: #a0a0b0; flex-shrink: 0; }
+  .log-msg { color: #d0d0e0; word-break: break-word; }
+  #debug-toggle { background: #0f3460; border: 1px solid #1a1a4e; color: #e0e0e0; padding: 6px 12px; border-radius: 4px; font-size: 13px; cursor: pointer; }
+  #debug-toggle:hover { background: #1a1a5e; }
+  #debug-toggle.active { border-color: #e94560; color: #e94560; }
+
+  /* Boxes diagram */
+  .box-cell rect { stroke: #0f3460; stroke-width: 2px; rx: 4px; ry: 4px; cursor: pointer; }
+  .box-cell rect.box-Table { fill: #1a2a4e; stroke: #4e7eff; }
+  .box-cell rect.box-Rule { fill: #1a1a2e; stroke: #e94560; }
+  .box-cell rect.box-Attribute { fill: #1a2a1e; stroke: #4e9e4e; }
+  .box-cell rect.box-Skill { fill: #2a1a2e; stroke: #9e4ee9; }
+  .box-cell rect.box-Trait { fill: #2a2a1e; stroke: #f9a825; }
+  .box-cell rect.box-Ability { fill: #1a2a2e; stroke: #4ee9e9; }
+  .box-cell rect.box-Action { fill: #2e1a1a; stroke: #e94e4e; }
+  .box-cell rect.box-StatusEffect { fill: #1a2e1a; stroke: #4ee94e; }
+  .box-cell rect.box-Item { fill: #2e2a1a; stroke: #e9b84e; }
+  .box-cell rect.box-Equipment { fill: #2e1a2a; stroke: #e94e9e; }
+  .box-cell rect.box-Weapon { fill: #2e1a1e; stroke: #e94e7e; }
+  .box-cell rect.box-Spell { fill: #1a1a2e; stroke: #7e4ee9; }
+  .box-cell rect.box-Formula { fill: #1a2e2e; stroke: #4ee9b8; }
+  .box-cell rect.box-Definition { fill: #2a1a1a; stroke: #e97e4e; }
+  .box-cell rect.box-Example { fill: #1a2e2a; stroke: #4ee97e; }
+  .box-cell rect.box-Situation { fill: #2e2a2a; stroke: #b8b8b8; }
+  .box-cell rect.box-Modifier { fill: #2a2e1a; stroke: #b8e94e; }
+  .box-cell rect.box-root { fill: #16213e; stroke: #0f3460; stroke-width: 3px; }
+  .box-cell.has-comment rect { stroke: #f9a825; stroke-width: 3px; }
+  .box-cell.collapsed rect { stroke-dasharray: 6 4; }
+  .box-cell text.box-label { font-size: 10px; fill: #e0e0e0; pointer-events: none; }
+  .box-cell text.box-content-preview { font-size: 10px; fill: #8a8aa0; pointer-events: none; }
+  .box-cell text.box-type { font-size: 8px; fill: #a0a0b0; pointer-events: none; }
+</style>
+</head>
+<body>
+
+<!-- Login gate -->
+<div id="login-screen" class="login-screen">
+  <div class="login-card">
+    <h1>Slitherer Tree Viewer</h1>
+    <p class="subtitle">Enter your API token to continue</p>
+    <form id="login-form">
+      <div class="login-field">
+        <label for="login-token">API Token</label>
+        <input type="password" id="login-token" placeholder="Bearer token" required autocomplete="off" />
+      </div>
+      <button type="submit" id="login-btn" class="login-btn">Connect</button>
+      <div id="login-error" class="login-error"></div>
+    </form>
+  </div>
+</div>
+
+<!-- Main app -->
+<div id="app" class="hidden">
+  <div id="controls">
+    <label>Source:</label>
+    <select id="source-select">
+      <option value="">All sources</option>
+    </select>
+    <label>Filter:</label>
+    <input type="text" id="filter-input" placeholder="Filter by name/type/section...">
+    <label>Type:</label>
+    <select id="type-filter">
+      <option value="">All types</option>
+    </select>
+    <label>Parent:</label>
+    <select id="parent-mode">
+      <option value="primary">Primary</option>
+      <option value="secondary">Secondary</option>
+    </select>
+    <label>Diagram:</label>
+    <select id="diagram-mode">
+      <option value="boxes">Boxes</option>
+      <option value="tree">Tree</option>
+    </select>
+    <button id="export-btn" title="Export comments as JSON">Export</button>
+    <button id="import-btn" title="Import comments from JSON">Import</button>
+    <input type="file" id="import-file" accept=".json" style="display:none">
+    <button id="clear-comments-btn" class="danger" title="Clear all comments">Clear Comments</button>
+    <button id="debug-toggle" title="Toggle debug log panel">Debug Log</button>
+    <button id="logout-btn" title="Disconnect">Logout</button>
+    <span id="status"></span>
+  </div>
+
+  <div id="tree-container">
+    <svg id="tree-svg"></svg>
+  </div>
+
+  <div id="side-panel" class="side-panel">
+    <div class="side-panel-header">
+      <h2 id="side-panel-title">Unit Details</h2>
+      <button id="side-panel-close" title="Close">&times;</button>
+    </div>
+    <div id="side-panel-body"></div>
+  </div>
+
+  <div class="node-tooltip" id="tooltip"></div>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#e94560"></div> Expanded unit</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#0f3460;border:1px solid #e94560"></div> Collapsed (click to expand)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#e94560;border:3px solid #f9a825"></div> Has comment</div>
+  </div>
+</div>
+
+<!-- Comment modal -->
+<div id="comment-modal">
+  <div class="modal">
+    <h3 id="comment-modal-title">Add Comment</h3>
+    <div class="node-info" id="comment-modal-info"></div>
+    <textarea id="comment-text" placeholder="Write your comment about this unit..."></textarea>
+    <div class="actions">
+      <button class="danger" id="comment-delete-btn">Delete Comment</button>
+      <button id="comment-cancel-btn">Cancel</button>
+      <button id="comment-save-btn">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Context menu -->
+<div id="context-menu">
+  <div class="item" id="ctx-add-comment">Add/Edit Comment</div>
+  <div class="item delete" id="ctx-delete-comment" style="display:none">Delete Comment</div>
+</div>
+
+<!-- Debug log panel -->
+<div id="debug-panel">
+  <div id="debug-panel-header">
+    <span class="title">Debug Log</span>
+    <span class="count" id="debug-log-count"></span>
+    <span class="spacer"></span>
+    <button id="debug-pause-btn">Pause</button>
+    <button id="debug-clear-btn" class="danger">Clear</button>
+    <button id="debug-close-btn">&times;</button>
+  </div>
+  <div id="debug-log-list"></div>
+</div>
+
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+const API_URL = "https://api.slitherer.workers.dev";
+const AUTH_STORAGE = "slitherer_debug_auth";
+const COMMENTS_STORAGE = "slitherer_tree_comments";
+
+let apiKey = "";
+let allRoots = null;
+let allFlatUnits = null;
+let currentRoot = null;
+let currentSourceId = "";
+let parentMode = "primary";
+let diagramMode = "boxes";
+let comments = {};
+let contextMenuNode = null;
+let collapsedNodeIds = new Set(); // track collapsed box nodes by ID for refresh
+let sidePanelUnitId = null; // track open side panel unit for refresh
+let refreshTimer = null;
+
+// ---- Comments ----
+function loadComments() {
+  try { comments = JSON.parse(localStorage.getItem(COMMENTS_STORAGE) || "{}"); }
+  catch { comments = {}; }
+}
+function saveComments() { localStorage.setItem(COMMENTS_STORAGE, JSON.stringify(comments)); }
+function commentFor(id) { return comments[id] || null; }
+function hasComment(id) { return !!comments[id]; }
+loadComments();
+
+// ---- Auth ----
+function storeAuth(token) { localStorage.setItem(AUTH_STORAGE, JSON.stringify({ apiKey: token })); }
+function clearAuth() { localStorage.removeItem(AUTH_STORAGE); }
+function getStoredAuth() {
+  try { return JSON.parse(localStorage.getItem(AUTH_STORAGE) || "null"); }
+  catch { return null; }
+}
+
+function showApp() {
+  document.getElementById("login-screen").classList.add("hidden");
+  document.getElementById("app").classList.remove("hidden");
+  loadTree();
+  startAutoRefresh();
+}
+
+function showLogin() {
+  document.getElementById("app").classList.add("hidden");
+  document.getElementById("login-screen").classList.remove("hidden");
+  document.getElementById("login-token").focus();
+}
+
+async function verifyToken(token) {
+  try {
+    const res = await fetch(`${API_URL}/query/verify`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({}),
+    });
+    if (res.ok) return { ok: true };
+    if (res.status === 401) return { ok: false, error: "Invalid API token" };
+    return { ok: false, error: `Server returned HTTP ${res.status}` };
+  } catch (err) {
+    return { ok: false, error: `Network error: ${err.message}` };
+  }
+}
+
+// Login form
+document.getElementById("login-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const token = document.getElementById("login-token").value.trim();
+  const errorEl = document.getElementById("login-error");
+  const btn = document.getElementById("login-btn");
+  if (!token) { errorEl.textContent = "API token is required"; errorEl.classList.add("visible"); return; }
+  errorEl.classList.remove("visible");
+  btn.disabled = true; btn.textContent = "Connecting...";
+  const result = await verifyToken(token);
+  btn.disabled = false; btn.textContent = "Connect";
+  if (result.ok) { apiKey = token; storeAuth(token); showApp(); }
+  else { errorEl.textContent = result.error || "Unknown error"; errorEl.classList.add("visible"); }
+});
+
+// Logout
+document.getElementById("logout-btn").addEventListener("click", () => {
+  stopAutoRefresh();
+  stopDebugLogPolling();
+  apiKey = "";
+  clearAuth();
+  showLogin();
+  document.getElementById("login-token").value = "";
+});
+
+// Auto-login on page load
+(async () => {
+  const stored = getStoredAuth();
+  if (stored?.apiKey) {
+    const result = await verifyToken(stored.apiKey);
+    if (result.ok) { apiKey = stored.apiKey; showApp(); return; }
+  }
+  showLogin();
+})();
+
+// ---- Controls ----
+document.getElementById("filter-input").addEventListener("input", applyFilter);
+document.getElementById("type-filter").addEventListener("change", applyFilter);
+document.getElementById("source-select").addEventListener("change", () => {
+  currentSourceId = document.getElementById("source-select").value;
+  loadTree();
+});
+document.getElementById("parent-mode").addEventListener("change", () => {
+  parentMode = document.getElementById("parent-mode").value;
+  if (allFlatUnits) {
+    allRoots = buildTree(allFlatUnits, parentMode);
+    rerender();
+  }
+});
+document.getElementById("diagram-mode").addEventListener("change", () => {
+  diagramMode = document.getElementById("diagram-mode").value;
+  savedZoomTransform = null;
+  rerender();
+});
+document.getElementById("export-btn").addEventListener("click", exportComments);
+document.getElementById("import-btn").addEventListener("click", () => document.getElementById("import-file").click());
+document.getElementById("import-file").addEventListener("change", importComments);
+document.getElementById("clear-comments-btn").addEventListener("click", clearAllComments);
+
+// Comment modal
+document.getElementById("comment-cancel-btn").addEventListener("click", closeCommentModal);
+document.getElementById("comment-save-btn").addEventListener("click", saveComment);
+document.getElementById("comment-delete-btn").addEventListener("click", deleteComment);
+
+// Context menu
+document.getElementById("ctx-add-comment").addEventListener("click", () => {
+  if (contextMenuNode) openCommentModal(contextMenuNode.data);
+  hideContextMenu();
+});
+document.getElementById("ctx-delete-comment").addEventListener("click", () => {
+  if (contextMenuNode) { delete comments[contextMenuNode.data.id]; saveComments(); rerender(); }
+  hideContextMenu();
+});
+document.addEventListener("click", hideContextMenu);
+
+// ---- Debug log panel ----
+let debugLogPolling = false;
+let debugLogPaused = false;
+let debugLogSince = null;
+let debugLogCount = 0;
+let debugLogTimer = null;
+
+function toggleDebugPanel() {
+  const panel = document.getElementById("debug-panel");
+  const btn = document.getElementById("debug-toggle");
+  const open = panel.classList.toggle("open");
+  btn.classList.toggle("active", open);
+  if (open) {
+    startDebugLogPolling();
+  } else {
+    stopDebugLogPolling();
+  }
+}
+
+function startDebugLogPolling() {
+  debugLogPolling = true;
+  debugLogPaused = false;
+  fetchDebugLogs();
+  debugLogTimer = setInterval(fetchDebugLogs, 3000);
+}
+
+function stopDebugLogPolling() {
+  debugLogPolling = false;
+  if (debugLogTimer) { clearInterval(debugLogTimer); debugLogTimer = null; }
+}
+
+async function fetchDebugLogs() {
+  if (debugLogPaused) return;
+  try {
+    const params = debugLogSince ? `?since=${encodeURIComponent(debugLogSince)}&limit=500` : "?limit=200";
+    const res = await fetch(`${API_URL}/debug/logs${params}`, {
+      headers: { authorization: `Bearer ${apiKey}` },
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    const logs = data.logs || [];
+    if (logs.length === 0) return;
+
+    const list = document.getElementById("debug-log-list");
+    for (const log of logs) {
+      const entry = document.createElement("div");
+      entry.className = "log-entry";
+      const time = log.createdAt ? log.createdAt.split("T")[1]?.replace("Z", "") ?? log.createdAt : "";
+      let dataStr = "";
+      try { if (log.data) dataStr = " — " + JSON.stringify(JSON.parse(log.data)); } catch {}
+      entry.innerHTML = `<span class="log-time">${time}</span><span class="log-level ${log.level}">${log.level}</span><span class="log-source">${log.source}</span><span class="log-msg">${log.message}${dataStr}</span>`;
+      list.appendChild(entry);
+      debugLogSince = log.createdAt;
+      debugLogCount++;
+    }
+    document.getElementById("debug-log-count").textContent = `${debugLogCount} entries`;
+    list.scrollTop = list.scrollHeight;
+  } catch (err) {
+    console.error("debug log fetch error:", err);
+  }
+}
+
+document.getElementById("debug-toggle").addEventListener("click", toggleDebugPanel);
+document.getElementById("debug-close-btn").addEventListener("click", () => {
+  document.getElementById("debug-panel").classList.remove("open");
+  document.getElementById("debug-toggle").classList.remove("active");
+  stopDebugLogPolling();
+});
+document.getElementById("debug-pause-btn").addEventListener("click", (e) => {
+  debugLogPaused = !debugLogPaused;
+  e.target.textContent = debugLogPaused ? "Resume" : "Pause";
+});
+document.getElementById("debug-clear-btn").addEventListener("click", async () => {
+  try {
+    await fetch(`${API_URL}/debug/logs`, { method: "DELETE", headers: { authorization: `Bearer ${apiKey}` } });
+    document.getElementById("debug-log-list").innerHTML = "";
+    debugLogSince = null;
+    debugLogCount = 0;
+    document.getElementById("debug-log-count").textContent = "";
+  } catch (err) { console.error("debug log clear error:", err); }
+});
+
+// ---- Tree loading ----
+async function loadTree() {
+  const status = document.getElementById("status");
+  status.textContent = "Loading...";
+
+  try {
+    // Load source nodes for dropdown
+    const sourcesRes = await fetch(`${API_URL}/debug/sources`, {
+      headers: { authorization: `Bearer ${apiKey}` },
+    });
+    if (sourcesRes.ok) {
+      const sourcesData = await sourcesRes.json();
+      const sourceSelect = document.getElementById("source-select");
+      const currentVal = currentSourceId;
+      sourceSelect.innerHTML = '<option value="">All sources</option>';
+      for (const s of sourcesData.sources) {
+        let section = "(root)";
+        try { section = JSON.parse(s.sectionPath).join(" > "); } catch {}
+        const label = `[${s.type}] ${section} (p.${s.page ?? "?"}) — ${s.unitCount} units`;
+        const opt = document.createElement("option");
+        opt.value = s.id;
+        opt.textContent = label;
+        if (s.id === currentVal) opt.selected = true;
+        sourceSelect.appendChild(opt);
+      }
+    }
+
+    // Load flat unit data (tree is built client-side to support parent mode switching)
+    let treeUrl = `${API_URL}/debug/tree?format=flat`;
+    if (currentSourceId) treeUrl += `&sourceNodeId=${encodeURIComponent(currentSourceId)}`;
+
+    const res = await fetch(treeUrl, { headers: { authorization: `Bearer ${apiKey}` } });
+    if (!res.ok) { const body = await res.text(); throw new Error(`HTTP ${res.status}: ${body}`); }
+    const data = await res.json();
+    allFlatUnits = data.units || [];
+    allRoots = buildTree(allFlatUnits, parentMode);
+    status.textContent = `Loaded ${allFlatUnits.length} units (${allRoots.length} roots)`;
+
+    // Populate type filter
+    const types = new Set(allFlatUnits.map((u) => u.type).filter(Boolean));
+    const typeSelect = document.getElementById("type-filter");
+    typeSelect.innerHTML = '<option value="">All types</option>';
+    for (const t of [...types].sort()) {
+      const opt = document.createElement("option");
+      opt.value = t; opt.textContent = t;
+      typeSelect.appendChild(opt);
+    }
+
+    if (diagramMode === "boxes") renderBoxes(allRoots);
+    else renderTree(allRoots);
+  } catch (err) {
+    status.textContent = `Error: ${err.message}`;
+    console.error(err);
+  }
+}
+
+/** Silent refresh: reload data without disturbing UI state.
+ *  Preserves scroll position, collapsed nodes, side panel, and filter state. */
+async function refreshTree() {
+  if (!apiKey) return;
+  try {
+    let treeUrl = `${API_URL}/debug/tree?format=flat`;
+    if (currentSourceId) treeUrl += `&sourceNodeId=${encodeURIComponent(currentSourceId)}`;
+    const res = await fetch(treeUrl, { headers: { authorization: `Bearer ${apiKey}` } });
+    if (!res.ok) return;
+    const data = await res.json();
+    const newFlatUnits = data.units || [];
+    if (newFlatUnits.length === 0) return;
+
+    // Save scroll positions
+    const scrollX = window.scrollX;
+    const scrollY = window.scrollY;
+    const panelScroll = document.getElementById("side-panel-body")?.scrollTop;
+
+    allFlatUnits = newFlatUnits;
+    allRoots = buildTree(allFlatUnits, parentMode);
+
+    // Re-populate type filter if types changed
+    const types = new Set(allFlatUnits.map((u) => u.type).filter(Boolean));
+    const typeSelect = document.getElementById("type-filter");
+    const existingTypes = new Set([...typeSelect.options].map((o) => o.value).filter(Boolean));
+    let typesChanged = types.size !== existingTypes.size;
+    if (!typesChanged) {
+      for (const t of types) { if (!existingTypes.has(t)) { typesChanged = true; break; } }
+    }
+    if (typesChanged) {
+      const currentType = typeSelect.value;
+      typeSelect.innerHTML = '<option value="">All types</option>';
+      for (const t of [...types].sort()) {
+        const opt = document.createElement("option");
+        opt.value = t; opt.textContent = t;
+        if (t === currentType) opt.selected = true;
+        typeSelect.appendChild(opt);
+      }
+    }
+
+    // Update status without flashing
+    const status = document.getElementById("status");
+    status.textContent = `Loaded ${allFlatUnits.length} units (${allRoots.length} roots)`;
+
+    // Re-apply filter or render
+    const filter = document.getElementById("filter-input").value;
+    const typeFilter = document.getElementById("type-filter").value;
+    if (filter || typeFilter) applyFilter();
+    else if (diagramMode === "boxes") renderBoxes(allRoots);
+    else renderTree(allRoots);
+
+    // Restore scroll positions
+    window.scrollTo(scrollX, scrollY);
+    if (panelScroll !== undefined && sidePanelUnitId) {
+      const panelBody = document.getElementById("side-panel-body");
+      if (panelBody) panelBody.scrollTop = panelScroll;
+    }
+
+    // Refresh side panel if open
+    if (sidePanelUnitId) {
+      const stillExists = allFlatUnits.some((u) => u.id === sidePanelUnitId);
+      if (stillExists) {
+        // Re-fetch side panel data silently
+        try {
+          const spRes = await fetch(`${API_URL}/debug/unit/${sidePanelUnitId}`, {
+            headers: { "Authorization": `Bearer ${apiKey}` },
+          });
+          if (spRes.ok) {
+            const spData = await spRes.json();
+            const panelBody = document.getElementById("side-panel-body");
+            const panelScrollNow = panelBody?.scrollTop;
+            renderSidePanel(spData);
+            if (panelScrollNow !== undefined) panelBody.scrollTop = panelScrollNow;
+          }
+        } catch {}
+      } else {
+        // Unit no longer exists, close panel
+        document.getElementById("side-panel").classList.remove("open");
+        sidePanelUnitId = null;
+      }
+    }
+  } catch (err) {
+    // Silent fail — don't disrupt UI on refresh errors
+    console.error("refreshTree error:", err);
+  }
+}
+
+function startAutoRefresh() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(refreshTree, 3000);
+}
+
+function stopAutoRefresh() {
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+}
+
+function buildTree(flat, mode) {
+  const parentKey = mode === "secondary" ? "secondaryParentId" : "parentId";
+  const byId = new Map(flat.map((u) => [u.id, { ...u, children: [] }]));
+  const roots = [];
+  for (const u of byId.values()) {
+    const pid = u[parentKey];
+    if (pid && byId.has(pid)) {
+      byId.get(pid).children.push(u);
+    } else {
+      roots.push(u);
+    }
+  }
+  return roots;
+}
+
+function countNodes(roots) {
+  let count = 0;
+  function visit(nodes) { for (const n of nodes) { count++; if (n.children) visit(n.children); } }
+  visit(roots);
+  return count;
+}
+
+function rerender() {
+  if (allRoots) {
+    const filter = document.getElementById("filter-input").value;
+    const typeFilter = document.getElementById("type-filter").value;
+    if (filter || typeFilter) applyFilter();
+    else if (diagramMode === "boxes") renderBoxes(allRoots);
+    else renderTree(allRoots);
+  }
+}
+
+// ---- Tree rendering ----
+let savedZoomTransform = null;
+
+function renderTree(roots) {
+  const svg = d3.select("#tree-svg");
+  const prevTransform = savedZoomTransform;
+  svg.selectAll("*").remove();
+  svg.style("margin", "").style("display", "");
+
+  const width = window.innerWidth;
+  const height = window.innerHeight - 60;
+  const g = svg.append("g");
+
+  const zoom = d3.zoom().scaleExtent([0.1, 3]).on("zoom", (e) => { savedZoomTransform = e.transform; g.attr("transform", e.transform); });
+  svg.call(zoom);
+
+  let treeData;
+  if (roots.length === 1) treeData = roots[0];
+  else treeData = { id: "__root__", name: "ROOT", type: "root", children: roots };
+
+  currentRoot = d3.hierarchy(treeData);
+  const treeLayout = d3.tree().nodeSize([60, 80]);
+  drawTree(g, currentRoot, treeLayout, height, width);
+  if (prevTransform) {
+    svg.call(zoom.transform, prevTransform);
+  } else {
+    svg.call(zoom.transform, d3.zoomIdentity.translate(40, 40));
+  }
+}
+
+function drawTree(g, root, treeLayout, height, width) {
+  treeLayout(root);
+
+  const svgEl = g.node().ownerSVGElement;
+  if (svgEl) {
+    const xExtent = d3.extent(root.descendants(), (d) => d.x);
+    const yExtent = d3.extent(root.descendants(), (d) => d.y);
+    const xMin = xExtent[0] ?? 0;
+    const xMax = xExtent[1] ?? 0;
+    const yMax = yExtent[1] ?? 0;
+    d3.select(svgEl).style("width", (xMax - xMin + 80) + "px").style("height", (yMax + 80) + "px");
+  }
+
+  g.selectAll(".link").data(root.links(), (d) => d.target.data.id)
+    .enter().append("path").attr("class", "link")
+    .attr("d", d3.linkVertical().x((d) => d.x).y((d) => d.y));
+
+  const node = g.selectAll(".node").data(root.descendants(), (d) => d.data.id)
+    .enter().append("g")
+    .attr("class", (d) => "node" + (hasComment(d.data.id) ? " has-comment" : "") + (d._children ? " collapsed" : ""))
+    .attr("transform", (d) => `translate(${d.x},${d.y})`)
+    .on("mouseover", showTooltip).on("mouseout", hideTooltip)
+    .on("click", (event, d) => {
+      if (event.shiftKey) { openCommentModal(d.data); return; }
+      openSidePanel(d.data.id);
+    })
+    .on("dblclick", (event, d) => {
+      event.stopPropagation();
+      if (d.children) { d._children = d.children; d.children = null; }
+      else if (d._children) { d.children = d._children; d._children = null; }
+      updateTree(g, root, treeLayout, height, width);
+    })
+    .on("contextmenu", (event, d) => { event.preventDefault(); contextMenuNode = d; showContextMenu(event, d); });
+
+  node.append("circle").attr("r", 5);
+  node.filter((d) => hasComment(d.data.id))
+    .append("text").attr("class", "comment-badge").attr("dy", -8).attr("text-anchor", "middle").text("\u270D");
+}
+
+function updateTree(g, root, treeLayout, height, width) {
+  treeLayout(root);
+
+  const svgEl = g.node().ownerSVGElement;
+  if (svgEl) {
+    const xExtent = d3.extent(root.descendants(), (d) => d.x);
+    const yExtent = d3.extent(root.descendants(), (d) => d.y);
+    const xMin = xExtent[0] ?? 0;
+    const xMax = xExtent[1] ?? 0;
+    const yMax = yExtent[1] ?? 0;
+    d3.select(svgEl).style("width", (xMax - xMin + 80) + "px").style("height", (yMax + 80) + "px");
+  }
+
+  const link = g.selectAll(".link").data(root.links(), (d) => d.target.data.id);
+  link.exit().remove();
+  link.enter().append("path").attr("class", "link")
+    .attr("d", d3.linkVertical().x((d) => d.x).y((d) => d.y))
+    .merge(link).attr("d", d3.linkVertical().x((d) => d.x).y((d) => d.y));
+
+  const node = g.selectAll(".node").data(root.descendants(), (d) => d.data.id);
+  node.exit().remove();
+  const nodeEnter = node.enter().append("g")
+    .attr("class", (d) => "node" + (hasComment(d.data.id) ? " has-comment" : "") + (d._children ? " collapsed" : ""))
+    .attr("transform", (d) => `translate(${d.x},${d.y})`)
+    .on("mouseover", showTooltip).on("mouseout", hideTooltip)
+    .on("click", (event, d) => {
+      if (event.shiftKey) { openCommentModal(d.data); return; }
+      openSidePanel(d.data.id);
+    })
+    .on("dblclick", (event, d) => {
+      event.stopPropagation();
+      if (d.children) { d._children = d.children; d.children = null; }
+      else if (d._children) { d.children = d._children; d._children = null; }
+      updateTree(g, root, treeLayout, height, width);
+    })
+    .on("contextmenu", (event, d) => { event.preventDefault(); contextMenuNode = d; showContextMenu(event, d); });
+
+  nodeEnter.append("circle").attr("r", 5);
+  nodeEnter.filter((d) => hasComment(d.data.id))
+    .append("text").attr("class", "comment-badge").attr("dy", -8).attr("text-anchor", "middle").text("\u270D");
+
+  nodeEnter.merge(node)
+    .attr("class", (d) => "node" + (hasComment(d.data.id) ? " has-comment" : "") + (d._children ? " collapsed" : ""))
+    .attr("transform", (d) => `translate(${d.x},${d.y})`);
+}
+
+// ---- Boxes rendering ----
+const BOX_PADDING = 16;
+const BOX_HEADER = 24;
+const BOX_MIN_LEAF_H = 44;
+const BOX_SPACING = 24;
+
+function renderBoxes(roots) {
+  const svg = d3.select("#tree-svg");
+  svg.selectAll("*").remove();
+
+  // Fixed document width (like a Word/PDF page), centered in viewport.
+  const docWidth = Math.min(900, window.innerWidth - 60);
+
+  let treeData;
+  if (roots.length === 1) treeData = roots[0];
+  else treeData = { id: "__root__", name: "ROOT", type: "root", children: roots };
+
+  const root = d3.hierarchy(treeData);
+  // Restore collapsed state from tracked IDs
+  if (collapsedNodeIds.size > 0) {
+    root.each((d) => {
+      if (d.children && collapsedNodeIds.has(d.data.id)) {
+        d._children = d.children;
+        d.children = null;
+      }
+    });
+  }
+  layoutBoxes(root, docWidth);
+  positionBoxes(root, 0, 0);
+
+  const totalHeight = root.boxHeight;
+  // Center the SVG horizontally; let it scroll natively (no d3.zoom).
+  d3.select(svg.node())
+    .style("width", docWidth + "px")
+    .style("height", (totalHeight + 20) + "px")
+    .style("margin", "0 auto")
+    .style("display", "block");
+
+  const g = svg.append("g");
+  drawBoxes(g, root);
+}
+
+/** Compute box sizes bottom-up. Each node gets a fixed width (the document width
+ *  minus accumulated padding). Children are stretched to fill their parent's
+ *  inner width. Heights are summed from children + header + padding. */
+function layoutBoxes(node, width) {
+  node.boxWidth = width;
+  const children = node.children ?? [];
+  if (children.length === 0) {
+    node.boxHeight = BOX_MIN_LEAF_H;
+    return;
+  }
+
+  const innerW = width - 2 * BOX_PADDING;
+  for (const c of children) layoutBoxes(c, innerW);
+
+  let childTotalH = 0;
+  for (const c of children) {
+    childTotalH += c.boxHeight + BOX_SPACING;
+  }
+  childTotalH -= BOX_SPACING;
+
+  node.boxHeight = childTotalH + BOX_HEADER + 2 * BOX_PADDING;
+}
+
+/** Assign absolute positions. Children are stretched to parent inner width. */
+function positionBoxes(node, x, y) {
+  node.x0 = x;
+  node.y0 = y;
+
+  const children = node.children ?? [];
+  if (children.length === 0) return;
+
+  let cy = y + BOX_HEADER + BOX_PADDING;
+  const cx = x + BOX_PADDING;
+  for (const c of children) {
+    positionBoxes(c, cx, cy);
+    cy += c.boxHeight + BOX_SPACING;
+  }
+}
+
+function drawBoxes(g, root) {
+  const allNodes = root.descendants();
+
+  const cell = g.selectAll(".box-cell").data(allNodes, (d) => d.data.id);
+  cell.exit().remove();
+
+  const cellEnter = cell.enter().append("g")
+    .attr("class", (d) => "box-cell" + (hasComment(d.data.id) ? " has-comment" : "") + (d._children ? " collapsed" : ""))
+    .on("mouseover", showTooltip).on("mouseout", hideTooltip)
+    .on("click", (event, d) => {
+      if (event.shiftKey) { openCommentModal(d.data); return; }
+      openSidePanel(d.data.id);
+    })
+    .on("dblclick", (event, d) => {
+      event.stopPropagation();
+      if (d.children) { d._children = d.children; d.children = null; collapsedNodeIds.add(d.data.id); }
+      else if (d._children) { d.children = d._children; d._children = null; collapsedNodeIds.delete(d.data.id); }
+      // Re-layout and re-draw
+      const docWidth = Math.min(900, window.innerWidth - 60);
+      layoutBoxes(root, docWidth);
+      positionBoxes(root, 0, 0);
+      const svgEl = g.node().ownerSVGElement;
+      if (svgEl) d3.select(svgEl).style("height", (root.boxHeight + 20) + "px");
+      drawBoxes(g, root);
+    })
+    .on("contextmenu", (event, d) => { event.preventDefault(); contextMenuNode = d; showContextMenu(event, d); });
+
+  cellEnter.append("rect");
+  cellEnter.append("text").attr("class", "box-label");
+  cellEnter.append("text").attr("class", "box-content-preview");
+  cellEnter.append("text").attr("class", "box-type");
+
+  cellEnter.merge(cell)
+    .attr("class", (d) => "box-cell" + (hasComment(d.data.id) ? " has-comment" : "") + (d._children ? " collapsed" : ""))
+    .each(function(d) {
+      const sel = d3.select(this);
+      const isRoot = d.data.id === "__root__";
+      const typeClass = isRoot ? "box-root" : `box-${d.data.type || "Rule"}`;
+      sel.select("rect")
+        .attr("class", typeClass)
+        .attr("x", d.x0)
+        .attr("y", d.y0)
+        .attr("width", d.boxWidth)
+        .attr("height", d.boxHeight);
+
+      // Label: show name or id, truncated to fit
+      const labelText = isRoot ? "ROOT" : (d.data.name || d.data.id);
+      const maxChars = Math.max(3, Math.floor((d.boxWidth - 8) / 6));
+      const display = labelText.length > maxChars ? labelText.slice(0, maxChars) + "…" : labelText;
+
+      sel.select("text.box-label")
+        .attr("x", d.x0 + 6)
+        .attr("y", d.y0 + 16)
+        .text(d.boxHeight < BOX_HEADER + 2 ? "" : display);
+
+      // Content preview: show start of unit content after the label, truncated
+      // to fit on the same line without expanding the box.
+      const contentText = isRoot ? "" : (d.data.content || "").replace(/\n/g, " ").trim();
+      const labelDisplay = isRoot ? "ROOT" : display;
+      const labelWidth = labelDisplay.length * 6 + 12; // approx char width + left padding
+      const availableWidth = d.boxWidth - labelWidth - 12;
+      const contentMaxChars = Math.max(0, Math.floor(availableWidth / 6));
+      const contentDisplay = contentText.length > contentMaxChars
+        ? contentText.slice(0, Math.max(0, contentMaxChars - 1)) + (contentMaxChars > 1 ? "…" : "")
+        : contentText;
+
+      sel.select("text.box-content-preview")
+        .attr("x", d.x0 + 6 + labelWidth)
+        .attr("y", d.y0 + 16)
+        .text(d.boxHeight < BOX_HEADER + 2 || isRoot ? "" : contentDisplay);
+
+      sel.select("text.box-type")
+        .attr("x", d.x0 + 6)
+        .attr("y", d.y0 + 30)
+        .text(d.boxHeight < BOX_HEADER + 12 ? "" : (d.data.type || ""));
+    });
+}
+
+// ---- Tooltip ----
+function showTooltip(event, d) {
+  const tooltip = document.getElementById("tooltip");
+  const data = d.data;
+  const comment = commentFor(data.id);
+  const content = data.content ? escapeHtml(data.content).slice(0, 500) + (data.content.length > 500 ? "..." : "") : "";
+  tooltip.innerHTML = `
+    <strong>${escapeHtml(data.name || data.id)}</strong><br>
+    ID: ${data.id}<br>
+    Type: ${data.type}<br>
+    Section: ${(data.section || []).join(" > ")}<br>
+    Page: ${data.page ?? "?"}<br>
+    Status: ${data.status}<br>
+    Children: ${(data.children || []).length}${data._children ? ` (${data._children.length} collapsed)` : ""}
+    ${content ? `<div class="unit-content">${content}</div>` : ""}
+    ${comment ? `<div class="comment">\u270D ${escapeHtml(comment)}</div>` : ""}
+    <div class="meta">Shift+click or right-click to comment</div>
+  `;
+  tooltip.style.display = "block";
+  tooltip.style.left = (event.clientX + 14) + "px";
+  tooltip.style.top = (event.clientY + 14) + "px";
+}
+function hideTooltip() { document.getElementById("tooltip").style.display = "none"; }
+function escapeHtml(text) { const div = document.createElement("div"); div.textContent = text; return div.innerHTML; }
+
+// ---- Side panel ----
+document.getElementById("side-panel-close").addEventListener("click", () => {
+  document.getElementById("side-panel").classList.remove("open");
+  sidePanelUnitId = null;
+});
+
+async function openSidePanel(unitId) {
+  if (unitId === "__root__") return;
+  sidePanelUnitId = unitId;
+  const panel = document.getElementById("side-panel");
+  const body = document.getElementById("side-panel-body");
+  const title = document.getElementById("side-panel-title");
+  panel.classList.add("open");
+  body.innerHTML = '<div class="sp-loading">Loading unit details...</div>';
+  title.textContent = unitId;
+
+  try {
+    const res = await fetch(`${API_URL}/debug/unit/${unitId}`, {
+      headers: { "Authorization": `Bearer ${apiKey}` },
+    });
+    if (!res.ok) { body.innerHTML = `<p>Error: ${res.status}</p>`; return; }
+    const data = await res.json();
+    renderSidePanel(data);
+  } catch (err) {
+    body.innerHTML = `<p>Error: ${escapeHtml(err.message)}</p>`;
+  }
+}
+
+function renderSidePanel(data) {
+  const u = data.unit;
+  const body = document.getElementById("side-panel-body");
+  const md = u.metadata || {};
+  const sections = [];
+
+  // Basic info
+  sections.push(`
+    <div class="sp-section">
+      <div class="sp-section-title">Basic Info</div>
+      <div class="sp-field"><span class="sp-field-label">ID</span><span class="sp-field-value">${u.id}</span></div>
+      <div class="sp-field"><span class="sp-field-label">Type</span><span class="sp-field-value">${u.type}</span></div>
+      <div class="sp-field"><span class="sp-field-label">Name</span><span class="sp-field-value">${escapeHtml(u.name || "(none)")}</span></div>
+      <div class="sp-field"><span class="sp-field-label">Page</span><span class="sp-field-value">${u.page ?? "?"}</span></div>
+      <div class="sp-field"><span class="sp-field-label">Section</span><span class="sp-field-value">${(u.section || []).join(" > ")}</span></div>
+      <div class="sp-field"><span class="sp-field-label">Status</span><span class="sp-field-value">${u.status}</span></div>
+      <div class="sp-field"><span class="sp-field-label">Source Order</span><span class="sp-field-value">${u.sourceOrder}</span></div>
+      <div class="sp-field"><span class="sp-field-label">Content Hash</span><span class="sp-field-value" style="font-size:11px">${u.contentHash}</span></div>
+      <div class="sp-field"><span class="sp-field-label">Updated</span><span class="sp-field-value" style="font-size:11px">${u.updatedAt}</span></div>
+    </div>
+  `);
+
+  // Content
+  if (u.content) {
+    sections.push(`
+      <div class="sp-section">
+        <div class="sp-section-title">Content</div>
+        <div class="sp-content">${escapeHtml(u.content)}</div>
+      </div>
+    `);
+  }
+
+  // Summary
+  if (u.summary) {
+    sections.push(`
+      <div class="sp-section">
+        <div class="sp-section-title">Summary</div>
+        <div class="sp-summary">${escapeHtml(u.summary)}</div>
+      </div>
+    `);
+  }
+
+  // Metadata
+  const mdFields = ["defines","references","requires","exceptions","modifies","modified_by","overrides","related_to","incompatible_with","creates","consumes","supersedes","example_of","part_of","aliases"];
+  const mdTags = mdFields.filter(f => md[f] && md[f].length > 0)
+    .map(f => `<div class="sp-field"><span class="sp-field-label">${f}</span><span class="sp-field-value">${md[f].map(escapeHtml).map(t => `<span class="sp-tag">${t}</span>`).join("")}</span></div>`)
+    .join("");
+  if (mdTags) {
+    sections.push(`<div class="sp-section"><div class="sp-section-title">Metadata</div>${mdTags}</div>`);
+  }
+
+  // Keywords
+  if (data.keywords && data.keywords.length > 0) {
+    sections.push(`
+      <div class="sp-section">
+        <div class="sp-section-title">Keywords</div>
+        <div class="sp-field-value">${data.keywords.map(escapeHtml).map(k => `<span class="sp-tag">${k}</span>`).join("")}</div>
+      </div>
+    `);
+  }
+
+  // Concepts
+  if (data.concepts && data.concepts.length > 0) {
+    const concepts = data.concepts.map(c => `<div class="sp-rel-item"><strong>${escapeHtml(c.name)}</strong>${c.description ? `<br><span style="color:#a0a0b0">${escapeHtml(c.description)}</span>` : ""}</div>`).join("");
+    sections.push(`<div class="sp-section"><div class="sp-section-title">Concepts</div>${concepts}</div>`);
+  }
+
+  // Relations — outgoing
+  if (data.relations && data.relations.outgoing && data.relations.outgoing.length > 0) {
+    const rels = data.relations.outgoing.map(r => `<div class="sp-rel-item"><span class="sp-rel-type">${r.type}</span> &rarr; <span class="sp-rel-target">${r.target}</span> <span style="color:#a0a0b0">(conf: ${r.confidence})</span></div>`).join("");
+    sections.push(`<div class="sp-section"><div class="sp-section-title">Relations (Outgoing)</div>${rels}</div>`);
+  }
+
+  // Relations — incoming
+  if (data.relations && data.relations.incoming && data.relations.incoming.length > 0) {
+    const rels = data.relations.incoming.map(r => `<div class="sp-rel-item"><span class="sp-rel-target">${r.source}</span> &rarr; <span class="sp-rel-type">${r.type}</span> <span style="color:#a0a0b0">(conf: ${r.confidence})</span></div>`).join("");
+    sections.push(`<div class="sp-section"><div class="sp-section-title">Relations (Incoming)</div>${rels}</div>`);
+  }
+
+  // Hierarchy
+  const hierParts = [];
+  if (data.parent) hierParts.push(`<div class="sp-field"><span class="sp-field-label">Parent</span><span class="sp-field-value">${data.parent.id} (${data.parent.type})${data.parent.name ? " — " + escapeHtml(data.parent.name) : ""}</span></div>`);
+  if (data.secondaryParent) hierParts.push(`<div class="sp-field"><span class="sp-field-label">Sec. Parent</span><span class="sp-field-value">${data.secondaryParent.id} (${data.secondaryParent.type})${data.secondaryParent.name ? " — " + escapeHtml(data.secondaryParent.name) : ""}</span></div>`);
+  if (data.children && data.children.length > 0) {
+    const childrenList = data.children.map(c => `<span class="sp-tag">${c.id} (${c.type})</span>`).join("");
+    hierParts.push(`<div class="sp-field"><span class="sp-field-label">Children (${data.children.length})</span><span class="sp-field-value">${childrenList}</span></div>`);
+  }
+  if (hierParts.length > 0) {
+    sections.push(`<div class="sp-section"><div class="sp-section-title">Hierarchy</div>${hierParts.join("")}</div>`);
+  }
+
+  // Source node
+  if (data.sourceNode) {
+    sections.push(`
+      <div class="sp-section">
+        <div class="sp-section-title">Source Structure Node</div>
+        <div class="sp-field"><span class="sp-field-label">Node ID</span><span class="sp-field-value">${data.sourceNode.id}</span></div>
+        <div class="sp-field"><span class="sp-field-label">Type</span><span class="sp-field-value">${data.sourceNode.type}</span></div>
+        <div class="sp-field"><span class="sp-field-label">Page</span><span class="sp-field-value">${data.sourceNode.page ?? "?"}</span></div>
+        <div class="sp-field"><span class="sp-field-label">Section Path</span><span class="sp-field-value">${data.sourceNode.section_path}</span></div>
+      </div>
+    `);
+  }
+
+  // Embedding
+  if (u.embeddingId) {
+    sections.push(`<div class="sp-section"><div class="sp-section-title">Embedding</div><div class="sp-field"><span class="sp-field-label">Vector ID</span><span class="sp-field-value" style="font-size:11px">${u.embeddingId}</span></div></div>`);
+  }
+
+  // Comment
+  const comment = commentFor(u.id);
+  if (comment) {
+    sections.push(`<div class="sp-section"><div class="sp-section-title">Comment</div><div class="sp-summary" style="color:#f9a825">${escapeHtml(comment)}</div></div>`);
+  }
+
+  body.innerHTML = sections.join("");
+}
+
+// ---- Context menu ----
+function showContextMenu(event, d) {
+  const menu = document.getElementById("context-menu");
+  const hasCom = hasComment(d.data.id);
+  document.getElementById("ctx-add-comment").textContent = hasCom ? "Edit Comment" : "Add Comment";
+  document.getElementById("ctx-delete-comment").style.display = hasCom ? "block" : "none";
+  menu.style.display = "block";
+  menu.style.left = event.clientX + "px";
+  menu.style.top = event.clientY + "px";
+}
+function hideContextMenu() { document.getElementById("context-menu").style.display = "none"; contextMenuNode = null; }
+
+// ---- Comment modal ----
+function openCommentModal(data) {
+  const modal = document.getElementById("comment-modal");
+  document.getElementById("comment-modal-title").textContent = hasComment(data.id) ? "Edit Comment" : "Add Comment";
+  document.getElementById("comment-modal-info").textContent =
+    `${data.name || data.id} — ${data.type} — ${(data.section || []).join(" > ")} — p.${data.page ?? "?"}`;
+  document.getElementById("comment-text").value = commentFor(data.id) || "";
+  document.getElementById("comment-delete-btn").style.display = hasComment(data.id) ? "block" : "none";
+  modal.style.display = "flex";
+  modal._nodeId = data.id;
+  setTimeout(() => document.getElementById("comment-text").focus(), 50);
+}
+function closeCommentModal() { document.getElementById("comment-modal").style.display = "none"; }
+function saveComment() {
+  const nodeId = document.getElementById("comment-modal")._nodeId;
+  const text = document.getElementById("comment-text").value.trim();
+  if (text) comments[nodeId] = text; else delete comments[nodeId];
+  saveComments(); closeCommentModal(); rerender();
+}
+function deleteComment() {
+  const nodeId = document.getElementById("comment-modal")._nodeId;
+  delete comments[nodeId]; saveComments(); closeCommentModal(); rerender();
+}
+
+// ---- Export / Import / Clear comments ----
+function exportComments() {
+  const data = { exportedAt: new Date().toISOString(), comments };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = `tree-comments-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click(); URL.revokeObjectURL(url);
+}
+function importComments(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const data = JSON.parse(e.target.result);
+      if (data.comments) { comments = { ...comments, ...data.comments }; saveComments(); rerender();
+        document.getElementById("status").textContent = `Imported ${Object.keys(data.comments).length} comments`; }
+    } catch (err) { alert("Failed to import: " + err.message); }
+  };
+  reader.readAsText(file); event.target.value = "";
+}
+function clearAllComments() {
+  const count = Object.keys(comments).length;
+  if (count === 0) { document.getElementById("status").textContent = "No comments to clear"; return; }
+  if (!confirm(`Delete all ${count} comments? This cannot be undone.`)) return;
+  comments = {}; saveComments(); rerender();
+  document.getElementById("status").textContent = `Cleared ${count} comments`;
+}
+
+// ---- Filter ----
+function applyFilter() {
+  const filter = document.getElementById("filter-input").value.toLowerCase();
+  const typeFilter = document.getElementById("type-filter").value;
+  if (!allRoots) return;
+  function matches(node) {
+    if (node.id === "__root__") return true;
+    const name = (node.name || node.id || "").toLowerCase();
+    const type = (node.type || "").toLowerCase();
+    const section = (node.section || []).join(" ").toLowerCase();
+    const typeOk = !typeFilter || node.type === typeFilter;
+    const textOk = !filter || name.includes(filter) || type.includes(filter) || section.includes(filter) || node.id.toLowerCase().includes(filter);
+    return typeOk && textOk;
+  }
+  function filterTree(node) {
+    if (!node.children) return matches(node) ? node : null;
+    const filteredChildren = node.children.map(filterTree).filter(Boolean);
+    if (filteredChildren.length > 0 || matches(node)) return { ...node, children: filteredChildren };
+    return null;
+  }
+  const filtered = allRoots.map(filterTree).filter(Boolean);
+  if (diagramMode === "boxes") renderBoxes(filtered);
+  else renderTree(filtered);
+  document.getElementById("status").textContent = `Showing ${filtered.length} root(s) (filtered)`;
+}
+</script>
+</body>
+</html>

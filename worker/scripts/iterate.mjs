@@ -1,29 +1,33 @@
 #!/usr/bin/env node
 /**
- * Full iteration cycle: clean local state, reparse structure.json,
- * clean remote DB, redeploy worker, reingest.
+ * Full iteration cycle: clear (local + remote), reparse structure.json,
+ * redeploy worker, reingest.
  *
  * Usage:
  *   npm run iterate              # blocks until ingestion completes
  *   npm run iterate -- --no-watch # starts ingestion in background
+ *   npm run iterate -- --stage metadata  # run only the metadata phase
  *   node scripts/iterate.mjs --no-watch
  */
 
 import { execSync, spawn } from "node:child_process";
-import { rmSync, existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import * as yaml from "js-yaml";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WORKER_DIR = resolve(__dirname, "..");
 const REPO_DIR = resolve(WORKER_DIR, "..");
 
-// ---- Config (from .dev.vars or defaults) ----
+// ---- Config (base URL from config/worker.yaml) ----
+const workerConfig = yaml.load(readFileSync(join(REPO_DIR, "config", "worker.yaml"), "utf8"));
+const DOCX = join(REPO_DIR, "rulebooks", "deorim_rules.docx");
 const RULEBOOK = join(REPO_DIR, "rulebooks", "deorim_rules.md");
 const STRUCTURE = join(REPO_DIR, "rulebooks", "deorim_rules.structure.json");
 const SOURCE_PATH = "rulebooks/deorim_rules.docx";
 const DOCUMENT_ID = "deorim_rules";
-const WORKER_URL = "https://slitherer-rag.slitherer.workers.dev";
+const WORKER_URL = workerConfig.url;
 
 // Read API key from .dev.vars
 let API_KEY = process.env.ADMIN_API_KEY ?? null;
@@ -74,32 +78,25 @@ function step(n, total, label) {
   console.log(`\n=== ${n}/${total} ${label} ===`);
 }
 
-// ---- 1/5: Clean local ingest state ----
-step(1, 5, "Cleaning local ingest state");
-rmSync(join(WORKER_DIR, ".ingest-state.json"), { force: true });
-rmSync(join(WORKER_DIR, "ingest.log"), { force: true });
+// ---- 1/4: Clear (local state + remote DB) ----
+step(1, 4, "Clearing local state + remote DB");
+run("npm run clear");
 console.log("Done.");
 
-// ---- 2/5: Reparse structure.json ----
-step(2, 5, "Reparsing structure.json");
-run(`python3 "${join(REPO_DIR, "parser", "markdown_to_structure.py")}" "${RULEBOOK}" -o "${STRUCTURE}"`, { cwd: REPO_DIR });
+// ---- 2/4: Reparse rulebook (DOCX -> Markdown -> structure.json) ----
+step(2, 4, "Reparsing rulebook");
+const venvPython = join(REPO_DIR, "parser", ".venv", "bin", "python");
+run(`"${venvPython}" "${join(REPO_DIR, "parser", "docx_to_markdown.py")}" "${DOCX}" -o "${RULEBOOK}"`, { cwd: REPO_DIR });
+run(`"${venvPython}" "${join(REPO_DIR, "parser", "markdown_to_structure.py")}" "${RULEBOOK}" -o "${STRUCTURE}"`, { cwd: REPO_DIR });
 console.log("Done.");
 
-// ---- 3/5: Clean remote DB ----
-step(3, 5, "Cleaning remote DB");
-const cleanupResp = execSync(
-  `curl -s -X POST -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" -d '{"documentId":"${DOCUMENT_ID}"}' ${WORKER_URL}/ingest/cleanup`,
-  { encoding: "utf8" }
-);
-console.log(cleanupResp.trim());
-
-// ---- 4/5: Deploy worker ----
-step(4, 5, "Deploying worker");
+// ---- 3/4: Deploy worker ----
+step(3, 4, "Deploying worker");
 run("npm run deploy");
 console.log("Done.");
 
-// ---- 5/5: Start ingestion ----
-step(5, 5, "Starting ingestion");
+// ---- 4/4: Start ingestion ----
+step(4, 4, "Starting ingestion");
 
 const ingestArgs = [
   "scripts/ingest.mjs",

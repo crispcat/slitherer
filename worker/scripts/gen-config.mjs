@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 /**
- * gen-config.mjs
+ * gen-config.mjs (worker)
  *
  * Reads YAML config files from ../config/ and generates
  * worker/src/config.gen.ts — a typed TypeScript module that
  * the worker imports at runtime.
+ *
+ * Sources: ingestion.yaml, retrieval.yaml, worker.yaml
  *
  * Run: npm run gen-config
  */
@@ -36,12 +38,12 @@ function freeze(obj) {
 
 const ingestion = loadYaml("ingestion.yaml");
 const retrieval = loadYaml("retrieval.yaml");
-const client = loadYaml("client.yaml");
+const worker = loadYaml("worker.yaml");
 
 const config = {
   ingestion,
   retrieval,
-  client,
+  worker,
 };
 
 freeze(config);
@@ -56,7 +58,7 @@ export const CONFIG = ${JSON.stringify(config, null, 2)} as const;
 
 export const INGESTION = CONFIG.ingestion;
 export const RETRIEVAL = CONFIG.retrieval;
-export const CLIENT = CONFIG.client;
+export const WORKER = CONFIG.worker;
 `;
 
 mkdirSync(dirname(OUTPUT_FILE), { recursive: true });
@@ -64,4 +66,4 @@ writeFileSync(OUTPUT_FILE, ts.trim() + "\n");
 console.log(`Generated ${OUTPUT_FILE}`);
 console.log(`  ingestion: ${Object.keys(ingestion).join(", ")}`);
 console.log(`  retrieval: ${Object.keys(retrieval).join(", ")}`);
-console.log(`  client:    ${Object.keys(client).join(", ")}`);
+console.log(`  worker:    ${Object.keys(worker).join(", ")}`);

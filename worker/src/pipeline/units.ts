@@ -3,7 +3,7 @@ import { SEMANTIC_UNIT_TYPES } from "../types";
 import { llmJson } from "../utils/llm";
 import { sha256 } from "../utils/hash";
 import { nextId } from "../utils/ids";
-import { detectTableStructure, buildTableUnitsFromTree } from "./table_tree";
+import { detectTableStructure, buildTableUnitsFromTree, decidePrevRuleLinking } from "./table_tree";
 import { INGESTION } from "../config.gen";
 
 interface DetectedUnit {
@@ -310,7 +310,17 @@ async function buildUnit(
   };
 }
 
-export async function detectSemanticUnits(env: Env, node: StructureNode): Promise<SemanticUnit[]> {
+/** Context from the previous leaf node's units, used to link tables to preceding rules. */
+export interface PreviousUnitContext {
+  id: string;
+  content: string;
+}
+
+export async function detectSemanticUnits(
+  env: Env,
+  node: StructureNode,
+  previousUnit?: PreviousUnitContext | null,
+): Promise<SemanticUnit[]> {
   if (!node.content.trim()) return [];
 
   let detected: DetectedUnit[] = [];
@@ -340,5 +350,29 @@ export async function detectSemanticUnits(env: Env, node: StructureNode): Promis
         : null;
     units.push(await buildUnit(node, { ...d, type }, i, parentUnitId, secondaryParentUnitId));
   }
+
+  // For tables: if the LLM decides the table belongs to the preceding rule,
+  // link the table's root unit(s) (those with parentUnitId === null) to the
+  // previous rule's unit. This makes the entire table hierarchy a child of
+  // the preceding rule, so retrieving the rule also retrieves its table data.
+  if (node.type === "table" && previousUnit && units.length > 0) {
+    const hasRootUnits = units.some((u) => u.parentUnitId === null);
+    if (hasRootUnits) {
+      try {
+        const shouldLink = await decidePrevRuleLinking(env, node, previousUnit.content);
+        if (shouldLink) {
+          for (const u of units) {
+            if (u.parentUnitId === null) {
+              u.parentUnitId = previousUnit.id;
+            }
+          }
+          console.log(`Linked table ${node.id} to previous rule ${previousUnit.id}`);
+        }
+      } catch (err) {
+        console.warn(`Prev-rule linking failed for ${node.id}: ${String(err)}`);
+      }
+    }
+  }
+
   return units;
 }

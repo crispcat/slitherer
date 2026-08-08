@@ -10,7 +10,11 @@
     "db:migrate:remote": "wrangler d1 execute slitherer-rag-db --remote --file=./schema.sql",
     "typecheck": "npm run gen-config && tsc --noEmit",
     "ingest": "node scripts/ingest.mjs",
-    "iterate": "node scripts/iterate.mjs"
+    "iterate": "node scripts/iterate.mjs",
+    "clear": "node scripts/clear.mjs",
+    "tree": "xdg-open https://debug.slitherer.workers.dev",
+    "deploy:client": "wrangler pages deploy ../client --project-name slitherer-rag --commit-dirty=true --branch main",
+    "deploy:debug": "wrangler pages deploy ../pages/debug --project-name slitherer-debug --commit-dirty=true --branch main"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250101.0",

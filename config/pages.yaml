@@ -1,0 +1,33 @@
+# Pages configuration — all settings for Cloudflare Pages sites.
+# Single source of truth for: pages URLs, client UI defaults, debug viewer.
+# The worker API URL is read from config/worker.yaml by gen-config.
+
+client:
+  url: https://client.slitherer.workers.dev
+  authStorageKey: slitherer_rag_auth
+  description: Client Pages site URL and settings.
+
+  ui:
+    defaultRequestMode: staged
+    defaultStream: true
+    defaultDebug: true
+    defaultGraphHops: 2
+    defaultMaxIterations: 3
+    assistantName: SLITHERER
+    assistantBadge: S
+    userBadge: U
+    description: Client UI defaults. Applied to the DOM on page load from config.js.
+
+  features:
+    tabbedChat: true
+    loginGate: true
+    streaming: true
+    debugOutput: true
+    thinkingBlocks: true
+    conversationHistory: true
+    description: Client feature flags. Read by ui.js from config.js at runtime.
+
+debug:
+  url: https://debug.slitherer.workers.dev
+  authStorageKey: slitherer_debug_auth
+  description: Debug viewer Pages site URL and settings.

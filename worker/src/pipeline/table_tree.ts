@@ -35,6 +35,10 @@ const ROW_REFINEMENT_PROMPT = INGESTION.prompts.tableRowRefinement.text;
 // The LLM builds the column tree from scratch, using the refined row skeleton as context.
 const COLUMN_TREE_PROMPT = INGESTION.prompts.tableColumnTree.text;
 
+// --- Phase 2c: Previous-rule linking prompt ---
+// The LLM decides whether a table with no header/description belongs to the preceding rule.
+const PREV_RULE_LINKING_PROMPT = INGESTION.prompts.tablePrevRuleLinking.text;
+
 /** Check if a table line is a separator row (---, :--:, etc.).
  *  A separator row has ALL cells consisting only of dashes, colons, and spaces. */
 function isSeparatorRow(trimmed: string): boolean {
@@ -161,6 +165,9 @@ export function buildRowSkeleton(content: string): { rowTree: TreeNode[]; colCou
     if (merged) {
       // Merged rows are structural (description/section), even if before a separator.
       type = "structural";
+    } else if (pseudoHeaders.has(ri)) {
+      // Deterministic pseudo-header: pre-separator row that's actually data.
+      type = "data";
     } else if (isHeader || isHeaderAfterMergedDesc) {
       type = "header";
     } else {
@@ -248,8 +255,11 @@ export function applyRowCorrections(
     if (corr.new_role) {
       const validRoles = ["description", "header", "section", "data", "structural"];
       if (!validRoles.includes(corr.new_role)) continue;
-      // Don't reclassify the root node (would break single-root guarantee).
-      if (node.parent === null && refined.length > 1) continue;
+      // The root node (parent === null) can be reclassified between "header"
+      // and "data" freely — this is the common pseudo-header case where the
+      // first row before --- is actually data, not a column header. The root
+      // stays the root regardless of its type, so the single-root guarantee
+      // is preserved.
       node.type = corr.new_role as TreeNode["type"];
     }
 
@@ -448,6 +458,58 @@ export async function detectTableStructure(env: Env, node: StructureNode): Promi
   return { row_tree: refinedRowTree, column_tree: dedupedColumnTree, reason: "skeleton + LLM refinement" };
 }
 
+// ---- Phase 2c: Previous-Rule Linking ----
+
+interface PrevRuleLinkingResult {
+  link: boolean;
+  reason: string;
+}
+
+/** Ask the LLM whether a table with no header/description belongs to the preceding rule.
+ *  If yes, the table's root units should be linked to the previous rule's unit.
+ *  Only the first few rows of the table are sent — enough for the LLM to judge
+ *  the table's structure and relationship to the previous rule. */
+export async function decidePrevRuleLinking(
+  env: Env,
+  node: StructureNode,
+  previousRuleContent: string,
+): Promise<boolean> {
+  const maxChars = INGESTION.tableProcessing.prevRuleContentMaxChars.value;
+  const truncatedPrev = previousRuleContent.slice(0, maxChars);
+  const previewRows = INGESTION.tableProcessing.prevRuleTablePreviewRows.value;
+  const tableLines = node.content.split("\n").filter((l) => l.trim().startsWith("|"));
+  const truncatedTable = tableLines.slice(0, previewRows).join("\n");
+  const prompt = PREV_RULE_LINKING_PROMPT
+    .replace("{{PREVIOUS_RULE_CONTENT}}", truncatedPrev)
+    .replace("{{TABLE_CONTENT}}", truncatedTable);
+
+  for (let attempt = 0; attempt <= INGESTION.tableProcessing.prevRuleLinkingMaxRetries.value; attempt++) {
+    try {
+      const result = await llmJson<PrevRuleLinkingResult>(
+        env,
+        prompt,
+        "Return the JSON object with the linking decision.",
+        { model: env.ANSWER_MODEL, maxRetries: INGESTION.tableProcessing.prevRuleLinkingMaxRetries.value },
+      );
+
+      if (result && typeof result.link === "boolean") {
+        console.log(`Prev-rule linking for ${node.id}: link=${result.link}, reason=${result.reason ?? "none"}`);
+        return result.link;
+      }
+      console.warn(`Prev-rule linking for ${node.id}: invalid response, defaulting to no link`);
+      return false;
+    } catch (err) {
+      if (attempt === 0) {
+        console.warn(`Prev-rule linking attempt 1 failed for ${node.id}, retrying: ${String(err)}`);
+      } else {
+        console.warn(`Prev-rule linking failed for ${node.id}, defaulting to no link: ${String(err)}`);
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
 /** Apply deterministic overrides to the column tree based on structural signals.
  *  These rules override the LLM only when there's a clear, language-agnostic
  *  AND document-agnostic structural signal:
@@ -597,7 +659,7 @@ function deduplicateColumnHeaders(
 /** Build semantic units from the double-tree structure. */
 export function buildTableUnitsFromTree(node: StructureNode, structure: TableStructure): DetectedUnit[] {
   const { row_tree, column_tree } = structure;
-  if (row_tree.length === 0) return [{ type: "Rule", name: "", content: node.content }];
+  if (row_tree.length === 0) return [{ type: "Table", name: "", content: node.content }];
 
   const { cells, rowIndices } = parseTableGrid(node.content);
   if (cells.length === 0) return [];
@@ -608,7 +670,7 @@ export function buildTableUnitsFromTree(node: StructureNode, structure: TableStr
 
   // Handle visual tables: one unit with full content.
   if (row_tree.length === 1 && row_tree[0].type === "visual") {
-    return [{ type: "Rule", name: "", content: node.content }];
+    return [{ type: "Table", name: "", content: node.content }];
   }
 
   const units: DetectedUnit[] = [];
@@ -643,7 +705,7 @@ export function buildTableUnitsFromTree(node: StructureNode, structure: TableStr
     const parentUnitIdx = tn.parent !== null ? rowNodeToUnitIdx.get(tn.parent) : undefined;
     rowNodeToUnitIdx.set(tn.id, units.length);
     units.push({
-      type: "Rule",
+      type: "Table",
       name: tn.label ?? "",
       content,
       parentIndex: parentUnitIdx,
@@ -694,7 +756,7 @@ export function buildTableUnitsFromTree(node: StructureNode, structure: TableStr
       : rowHeaderUnitIdx;
     colNodeToUnitIdx.set(tn.id, units.length);
     units.push({
-      type: "Rule",
+      type: "Table",
       name: tn.label ?? "",
       content,
       parentIndex: parentUnitIdx,
@@ -730,7 +792,18 @@ export function buildTableUnitsFromTree(node: StructureNode, structure: TableStr
   // when multiple column data nodes cover the same columns for a row.
   const seenRowColPairs = new Set<string>();
 
+  // Count column-tree data nodes. If there are multiple (SPLIT columns),
+  // a root data node (pseudo-header reclassified to data) is redundant —
+  // its column-split children already cover the content. Skip it so its
+  // children become roots and link to the table's parent (previous rule).
+  const colDataNodes = column_tree.filter((tn) => tn.type === "data");
+  const isSplitColumns = colDataNodes.length > 1;
+
   for (const rowNode of dataNodes) {
+    // Skip root data nodes in SPLIT tables — they're pseudo-headers whose
+    // content is fully covered by their column-split children.
+    if (isSplitColumns && rowNode.parent === null) continue;
+
     const rowParentNode = rowNode.parent !== null
       ? row_tree.find((r) => r.id === rowNode.parent)
       : undefined;
@@ -800,7 +873,7 @@ export function buildTableUnitsFromTree(node: StructureNode, structure: TableStr
           dataNodeToFirstUnitIdx.set(rowNode.id, unitIdx);
         }
         units.push({
-          type: "Rule",
+          type: "Table",
           name: rowNode.label ?? "",
           content,
           parentIndex: primaryParent,

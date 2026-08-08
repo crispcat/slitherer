@@ -1,19 +1,22 @@
-import type { Env, StructureDocument, StructureNode } from "../types";
+import type { Env, StructureDocument, StructureNode, SemanticUnit } from "../types";
 import { sha256 } from "../utils/hash";
+import { nextId } from "../utils/ids";
 import {
   countUnitsByStatus,
   createIngestionJob,
   getAllUnits,
   getIngestionJob,
+  getOrphanUnitsBySection,
   getSemanticUnitsBySourceNode,
   getUnitsByStatus,
   getUnitsByStatusParentFirst,
+  logDebug,
   updateIngestionJob,
   upsertDocument,
   upsertSemanticUnit,
   upsertStructureNode,
 } from "../utils/db";
-import { detectSemanticUnits } from "./units";
+import { detectSemanticUnits, type PreviousUnitContext } from "./units";
 import { generateSummary } from "./summary";
 import { extractMetadata } from "./metadata";
 import { extractRelationships } from "./relationships";
@@ -73,6 +76,8 @@ export async function startIngestion(env: Env, documentId: string, sourcePath: s
   };
   await createIngestionJob(env, jobId, documentId);
   await updateIngestionJob(env, jobId, "units", "running", JSON.stringify(detail));
+
+  await logDebug(env, "info", "ingestion", `Started ingestion job ${jobId}`, { documentId, sourcePath, totalLeafNodes: leafNodes.length });
 
   return { totalNodes: leafNodes.length };
 }
@@ -165,6 +170,8 @@ export async function processIngestionBatch(
       ? detail.nodeIds.length - detail.cursor
       : await countUnitsByStatus(env, statusForPhase(detail.phase));
 
+  await logDebug(env, "info", `ingestion:${detail.phase}`, `Batch complete`, { jobId, phase: detail.phase, unitsProcessed: detail.unitsProcessed, remaining, done: stageDone || done });
+
   return { done: stageDone || done, phase: detail.phase, unitsProcessed: detail.unitsProcessed, remaining };
 }
 
@@ -178,6 +185,109 @@ function statusForPhase(phase: IngestPhase): string {
       return "metadata_done";
     default:
       return "pending";
+  }
+}
+
+// ---- Incremental section hierarchy ----
+
+/** Build a map from JSON.stringify(path) → StructureNode for non-leaf nodes.
+ *  These are the nodes that will become section hierarchy units. */
+function buildPathToNodeMap(doc: StructureDocument): Map<string, StructureNode> {
+  const map = new Map<string, StructureNode>();
+  for (const node of Object.values(doc.nodes)) {
+    if (LEAF_TYPES.has(node.type)) continue;
+    if (node.path.length === 0) continue;
+    map.set(JSON.stringify(node.path), node);
+  }
+  return map;
+}
+
+/** Length of the common prefix of two arrays. */
+function commonPrefixLength(a: string[], b: string[]): number {
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return i;
+}
+
+/** Ensure section units exist for a path chain (shallowest first), linked
+ *  in a parent→child chain. Idempotent: checks getSemanticUnitsBySourceNode
+ *  before creating. Caches results in `cache` (path JSON → unit ID). */
+async function ensureSectionChain(
+  env: Env,
+  pathToNode: Map<string, StructureNode>,
+  sectionPath: string[],
+  cache: Map<string, string>,
+): Promise<void> {
+  for (let depth = 1; depth <= sectionPath.length; depth++) {
+    const prefix = sectionPath.slice(0, depth);
+    const key = JSON.stringify(prefix);
+    if (cache.has(key)) continue;
+
+    const label = prefix[prefix.length - 1];
+    const parentPrefix = prefix.slice(0, -1);
+    const parentKey = parentPrefix.length > 0 ? JSON.stringify(parentPrefix) : null;
+    const parentId = parentKey ? (cache.get(parentKey) ?? null) : null;
+
+    const node = pathToNode.get(key);
+    let sectionUnitId: string | null = null;
+
+    if (node) {
+      const existing = await getSemanticUnitsBySourceNode(env, node.id);
+      if (existing.length > 0) {
+        sectionUnitId = existing[0].id;
+        if (existing[0].parentUnitId !== parentId) {
+          existing[0].parentUnitId = parentId;
+          await upsertSemanticUnit(env, existing[0]);
+        }
+      }
+    }
+
+    if (!sectionUnitId) {
+      const id = nextId("Rule");
+      const content = node?.content ?? label;
+      const contentHash = await sha256(content);
+      await upsertSemanticUnit(env, {
+        id,
+        sourceNodeId: node?.id ?? `SECTION-${key}`,
+        parentUnitId: parentId,
+        secondaryParentUnitId: null,
+        sourceOrder: 0,
+        type: "Rule",
+        name: label,
+        page: node?.page ?? 0,
+        section: prefix,
+        content,
+        contentHash,
+        status: "pending",
+        updatedAt: new Date().toISOString(),
+      });
+      sectionUnitId = id;
+    }
+
+    cache.set(key, sectionUnitId);
+  }
+}
+
+/** Close a section: ensure its section unit chain exists, then link all
+ *  orphan units (parent_unit_id = null) with this exact path to the section unit. */
+async function closeSection(
+  env: Env,
+  pathToNode: Map<string, StructureNode>,
+  sectionPath: string[],
+  cache: Map<string, string>,
+): Promise<void> {
+  await ensureSectionChain(env, pathToNode, sectionPath, cache);
+  const sectionUnitId = cache.get(JSON.stringify(sectionPath));
+  if (!sectionUnitId) return;
+
+  const orphans = await getOrphanUnitsBySection(env, sectionPath);
+  for (const u of orphans) {
+    u.parentUnitId = sectionUnitId;
+    await upsertSemanticUnit(env, u);
+  }
+  if (orphans.length > 0) {
+    await logDebug(env, "info", "ingestion:units",
+      `Closed section ${JSON.stringify(sectionPath)}: linked ${orphans.length} orphans`);
   }
 }
 
@@ -195,28 +305,88 @@ async function stepUnitsPhase(env: Env, doc: StructureDocument, detail: IngestJo
     }
   }
 
+  // Section hierarchy: build path→node map for non-leaf structure nodes.
+  const pathToNode = buildPathToNodeMap(doc);
+  // Cache of path JSON → section unit ID (persists within this batch).
+  const sectionCache = new Map<string, string>();
+
+  // Determine the previous node's path (for cross-batch section closing).
+  let prevPath: string[] = [];
+  if (start > 0) {
+    const prevNode = doc.nodes[detail.nodeIds[start - 1]];
+    if (prevNode) prevPath = prevNode.path ?? [];
+  }
+
+  // Track the "primary" unit (first by source_order) from the previous leaf node,
+  // so tables can be linked to the preceding rule via LLM decision.
+  // Only rule/note nodes are valid "previous rule" candidates — tables should
+  // never be linked to other tables.
+  let previousUnit: PreviousUnitContext | null = null;
+  if (start > 0) {
+    const prevNodeId = detail.nodeIds[start - 1];
+    if (prevNodeId) {
+      const prevNode = doc.nodes[prevNodeId];
+      if (prevNode && prevNode.type !== "table") {
+        const prevUnits = await getSemanticUnitsBySourceNode(env, prevNodeId);
+        if (prevUnits.length > 0) {
+          // Pick the first unit by source_order (the "primary" unit of the previous node).
+          prevUnits.sort((a, b) => (a.sourceOrder ?? 0) - (b.sourceOrder ?? 0));
+          previousUnit = { id: prevUnits[0].id, content: prevUnits[0].content };
+        }
+      }
+    }
+  }
+
   for (let i = start; i < end; i++) {
     const node = doc.nodes[detail.nodeIds[i]];
     if (!node) continue;
+    const currentPath = node.path ?? [];
+
+    // Close sections that ended between prevPath and currentPath.
+    // Close from deepest to shallowest, stopping at the common prefix.
+    const commonLen = commonPrefixLength(prevPath, currentPath);
+    for (let depth = prevPath.length; depth > commonLen; depth--) {
+      await closeSection(env, pathToNode, prevPath.slice(0, depth), sectionCache);
+    }
 
     // Incremental update check: skip re-processing if content is unchanged.
     const existing = await getSemanticUnitsBySourceNode(env, node.id);
     const hash = await sha256(node.content);
     if (existing.length > 0 && existing.every((u) => u.contentHash === hash)) {
+      // Still update previousUnit context from existing units for the next node.
+      // Only rule/note nodes are valid previous-rule candidates.
+      if (existing.length > 0 && node.type !== "table") {
+        existing.sort((a, b) => (a.sourceOrder ?? 0) - (b.sourceOrder ?? 0));
+        previousUnit = { id: existing[0].id, content: existing[0].content };
+      }
+      prevPath = currentPath;
+      await logDebug(env, "info", "ingestion:units", `Skipped unchanged node ${node.id}`, { type: node.type });
       continue;
     }
 
-    const units = await detectSemanticUnits(env, node);
+    const units = await detectSemanticUnits(env, node, previousUnit);
     for (const unit of units) {
       await upsertSemanticUnit(env, unit); // status: "pending"
       detail.unitsProcessed += 1;
     }
+    // Update previousUnit context for the next node.
+    // Only rule/note nodes are valid previous-rule candidates.
+    if (units.length > 0 && node.type !== "table") {
+      previousUnit = { id: units[0].id, content: units[0].content };
+    }
+    prevPath = currentPath;
+    await logDebug(env, "info", "ingestion:units", `Processed node ${node.id}`, { type: node.type, unitsDetected: units.length });
   }
 
   detail.cursor = end;
   if (detail.cursor >= detail.nodeIds.length) {
+    // Close all remaining sections down to root.
+    for (let depth = prevPath.length; depth > 0; depth--) {
+      await closeSection(env, pathToNode, prevPath.slice(0, depth), sectionCache);
+    }
     detail.phase = "summary";
     detail.cursor = 0;
+    await logDebug(env, "info", "ingestion:units", `Units phase complete — transitioning to summary`, { totalProcessed: detail.unitsProcessed });
   }
 }
 
@@ -237,9 +407,11 @@ async function stepSummaryPhase(env: Env, detail: IngestJobDetail, batchSize: nu
     unit.embeddingId = unit.id;
     unit.status = "summary_done";
     await upsertSemanticUnit(env, unit);
+    await logDebug(env, "info", "ingestion:summary", `Summary+embed for ${unit.id}`, { name: unit.name, type: unit.type });
   }
   if (batch.length === 0) {
     detail.phase = "metadata";
+    await logDebug(env, "info", "ingestion:summary", `Summary phase complete — transitioning to metadata`);
   }
 }
 
@@ -253,9 +425,11 @@ async function stepMetadataPhase(env: Env, detail: IngestJobDetail, batchSize: n
     unit.status = "metadata_done";
     await upsertSemanticUnit(env, unit);
     await populateConceptsAndKeywords(env, unit);
+    await logDebug(env, "info", "ingestion:metadata", `Metadata for ${unit.id}`, { name: unit.name, type: unit.type });
   }
   if (batch.length === 0) {
     detail.phase = "relations";
+    await logDebug(env, "info", "ingestion:metadata", `Metadata phase complete — transitioning to relations`);
   }
 }
 
@@ -273,9 +447,11 @@ async function stepRelationsPhase(env: Env, detail: IngestJobDetail, batchSize: 
     await populateRelations(env, unit, relations);
     unit.status = "relations_done";
     await upsertSemanticUnit(env, unit);
+    await logDebug(env, "info", "ingestion:relations", `Relations for ${unit.id}`, { name: unit.name, relationsFound: relations.length });
   }
   if (batch.length === 0) {
     detail.phase = "done";
+    await logDebug(env, "info", "ingestion:relations", `Relations phase complete — ingestion done`);
   }
 }
 

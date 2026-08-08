@@ -1,6 +1,6 @@
 import type { Env, StructureDocument, ConversationMessage } from "./types";
 import { processIngestionBatch, rebuildAllRelationships, startIngestion, INGEST_STAGES } from "./pipeline/ingest";
-import { cleanupDocument, getIngestionJob, getLastConversationTurns, logQueryStep, resetIngestionStage } from "./utils/db";
+import { cleanupDocument, getIngestionJob, getLastConversationTurns, logQueryStep, logDebug, resetIngestionStage, getAllUnits, getSourceNodesWithUnits, getUnitDetails, getDebugLogs, clearDebugLogs } from "./utils/db";
 import { runQuery, runQueryStream } from "./retrieval/pipeline";
 import { route, generateChatResponse } from "./retrieval/router";
 import { decompose } from "./retrieval/decompose";
@@ -8,12 +8,12 @@ import { retrieve } from "./retrieval/query";
 import { checkSufficiency } from "./retrieval/sufficiency";
 import { generateAnswer } from "./retrieval/answer";
 import { uuid } from "./utils/ids";
-import { INGESTION, CLIENT } from "./config.gen";
+import { INGESTION, WORKER } from "./config.gen";
 
-const CORS_ORIGIN = CLIENT.cors.allowOrigin.value;
-const CORS_HEADERS = CLIENT.cors.allowHeaders.value;
-const CORS_METHODS = CLIENT.cors.allowMethods.value;
-const CORS_MAX_AGE = String(CLIENT.cors.maxAge.value);
+const CORS_ORIGIN = WORKER.cors.allowOrigin;
+const CORS_HEADERS = WORKER.cors.allowHeaders;
+const CORS_METHODS = WORKER.cors.allowMethods;
+const CORS_MAX_AGE = String(WORKER.cors.maxAge);
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data, null, 2), {
@@ -488,9 +488,90 @@ export default {
         return json({ ...result, durationMs });
       }
 
+
+      // GET /debug/sources
+      // Lists all structure nodes that have semantic units, with unit counts.
+      // Used by the tree viewer to populate the source node dropdown.
+      if (url.pathname === "/debug/sources" && request.method === "GET") {
+        const sources = await getSourceNodesWithUnits(env);
+        return json({ sources });
+      }
+
+      // GET /debug/tree?format=tree|flat&sourceNodeId=<id>
+      // Returns the semantic unit hierarchy for visualization.
+      // - format=flat (default): array of {id, parentId, secondaryParentId, type, name, section, status}
+      // - format=tree: nested tree rooted at units with no parent
+      // - sourceNodeId: filter to units from a specific structure node (table/rule)
+      if (url.pathname === "/debug/tree" && request.method === "GET") {
+        const format = url.searchParams.get("format") ?? "flat";
+        const sourceNodeId = url.searchParams.get("sourceNodeId");
+        let units = await getAllUnits(env);
+        if (sourceNodeId) {
+          units = units.filter((u) => u.sourceNodeId === sourceNodeId);
+        }
+        const flat = units.map((u) => ({
+          id: u.id,
+          parentId: u.parentUnitId ?? null,
+          secondaryParentId: u.secondaryParentUnitId ?? null,
+          type: u.type,
+          name: u.name ?? "",
+          content: u.content ?? "",
+          section: u.section,
+          page: u.page,
+          status: u.status,
+          sourceNodeId: u.sourceNodeId,
+        }));
+        if (format === "tree") {
+          const byId = new Map(flat.map((u) => [u.id, { ...u, children: [] as any[] }]));
+          const roots: any[] = [];
+          for (const u of byId.values()) {
+            if (u.parentId && byId.has(u.parentId)) {
+              byId.get(u.parentId)!.children.push(u);
+            } else {
+              roots.push(u);
+            }
+          }
+          return json({ roots });
+        }
+        return json({ units: flat });
+      }
+
+      // GET /debug/unit/:id
+      // Returns comprehensive data for a single unit: all fields, metadata,
+      // keywords, concepts, relations (outgoing + incoming), parent/child units,
+      // and the source structure node. Used by the tree viewer side panel.
+      {
+        const unitMatch = url.pathname.match(/^\/debug\/unit\/(.+)$/);
+        if (unitMatch && request.method === "GET") {
+          const details = await getUnitDetails(env, unitMatch[1]);
+          if (!details) return json({ error: "unit not found" }, 404);
+          return json(details);
+        }
+      }
+
+      // GET /debug/logs?since=<ISO>&limit=<n>
+      // Returns debug log entries from the ingestion/retrieval pipelines.
+      // If `since` is provided, returns only logs created after that timestamp
+      // (ascending order) — used for polling. Otherwise returns the most recent
+      // `limit` logs (descending order).
+      if (url.pathname === "/debug/logs" && request.method === "GET") {
+        const since = url.searchParams.get("since") ?? undefined;
+        const limit = parseInt(url.searchParams.get("limit") ?? "200", 10);
+        const logs = await getDebugLogs(env, since, limit);
+        return json({ logs });
+      }
+
+      // DELETE /debug/logs
+      // Clears all debug log entries.
+      if (url.pathname === "/debug/logs" && request.method === "DELETE") {
+        await clearDebugLogs(env);
+        return json({ ok: true });
+      }
+
       return json({ error: "not found" }, 404);
     } catch (err: any) {
       console.error(err?.stack ?? err); // full detail in `wrangler tail`, not in the response
+      try { await logDebug(env, "error", "worker", err?.message ?? "internal error", { stack: err?.stack }); } catch {}
       return json({ error: err?.message ?? "internal error" }, 500);
     }
   },

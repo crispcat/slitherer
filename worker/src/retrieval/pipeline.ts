@@ -7,6 +7,7 @@ import { generateAnswer } from "./answer";
 import {
   appendConversationMessage,
   getLastConversationTurns,
+  logDebug,
   logQueryStep,
 } from "../utils/db";
 import { RETRIEVAL } from "../config.gen";
@@ -50,6 +51,7 @@ export async function runQuery(
   console.log(`[pipeline] Step 1: Router — question: "${question.slice(0, 80)}..."`);
   const { value: routerResult, durationMs: routerMs } = await timed(() => route(env, question, history));
   console.log(`[pipeline] Router: rag=${routerResult.rag}, language=${routerResult.language}, duration=${routerMs}ms`);
+  await logDebug(env, "info", "retrieval:router", `rag=${routerResult.rag}, language=${routerResult.language}`, { durationMs: routerMs, question: question.slice(0, 120) });
 
   if (conversationId) {
     await logQueryStep(env, "router", { question, historyLength: history.length }, routerResult, routerMs, conversationId);
@@ -89,6 +91,7 @@ export async function runQuery(
     decompose(env, routerResult.russianQuery, history)
   );
   console.log(`[pipeline] Decompose: ${decomposeResult.subQueries.length} sub-queries, threshold=${decomposeResult.rerankThreshold}, duration=${decomposeMs}ms`);
+  await logDebug(env, "info", "retrieval:decompose", `${decomposeResult.subQueries.length} sub-queries`, { durationMs: decomposeMs, threshold: decomposeResult.rerankThreshold });
 
   if (conversationId) {
     await logQueryStep(env, "decompose", { russianQuery: routerResult.russianQuery }, decomposeResult, decomposeMs, conversationId);
@@ -113,6 +116,7 @@ export async function runQuery(
       })
     );
     console.log(`[pipeline] Retrieve: ${retrieved.length} candidates, duration=${retrieveMs}ms`);
+    await logDebug(env, "info", "retrieval:retrieve", `${retrieved.length} candidates (iter ${iteration + 1})`, { durationMs: retrieveMs, totalAfterMerge: allRetrieved.size });
 
     if (conversationId) {
       await logQueryStep(env, "retrieve", { iteration, subQueries: currentSubQueries }, { count: retrieved.length }, retrieveMs, conversationId);
@@ -147,6 +151,7 @@ export async function runQuery(
         checkSufficiency(env, routerResult.russianQuery, [...allRetrieved.values()], currentSubQueries)
       );
       console.log(`[pipeline] Sufficiency: sufficient=${sufficiency.sufficient}, gaps=${sufficiency.gaps.length}, duration=${suffMs}ms`);
+      await logDebug(env, "info", "retrieval:sufficiency", `sufficient=${sufficiency.sufficient}, gaps=${sufficiency.gaps.length}`, { durationMs: suffMs, iteration: iteration + 1 });
 
       if (conversationId) {
         await logQueryStep(env, "sufficiency", { iteration: iteration + 1 }, sufficiency, suffMs, conversationId);
@@ -187,6 +192,7 @@ export async function runQuery(
     })
   );
   console.log(`[pipeline] Answer: ${result.citations.length} citations, duration=${answerMs}ms`);
+  await logDebug(env, "info", "retrieval:answer", `${result.citations.length} citations`, { durationMs: answerMs, evidenceCount: retrievedList.length });
 
   if (conversationId) {
     await logQueryStep(env, "answer", { question, language: routerResult.language }, result, answerMs, conversationId);

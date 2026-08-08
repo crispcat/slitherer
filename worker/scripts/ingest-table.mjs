@@ -5,7 +5,7 @@
  *
  * Usage:
  *   node scripts/ingest-table.mjs \
- *     --url https://slitherer-rag.slitherer.workers.dev \
+ *     --url https://api.slitherer.workers.dev \
  *     --structure ../rulebooks/deorim_rules.structure.json \
  *     --node-id TABLE-00020
  *

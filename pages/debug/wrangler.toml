@@ -1,0 +1,6 @@
+name = "debug"
+compatibility_date = "2024-09-01"
+
+[assets]
+directory = "."
+exclude = ["wrangler.toml"]

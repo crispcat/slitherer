@@ -1,0 +1,12 @@
+# Worker configuration — server-side settings for the Cloudflare Worker.
+# Single source of truth for: worker URL, CORS headers.
+
+url: https://api.slitherer.workers.dev
+description: Worker deployment URL. Read by Node scripts and Pages sites (via gen-config).
+
+cors:
+  allowOrigin: '*'
+  allowHeaders: authorization, content-type
+  allowMethods: GET, POST, OPTIONS
+  maxAge: 86400
+  description: CORS headers on the worker. Controls which origins can call the API.

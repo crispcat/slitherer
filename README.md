@@ -15,7 +15,7 @@ Implements the MVP deliverables from [IMPLEMENTATION.md](IMPLEMENTATION.md) for 
   embedding generation, D1 knowledge graph, agentic retrieval (router →
   decompose → retrieve → sufficiency loop → answer), and citation-aware
   answer generation. Uses Workers AI (`AI` binding), Vectorize, D1, and R2.
-- **`client/`** (HTML/CSS/JS, Cloudflare Pages) — GPT-like chat UI for the
+- **`pages/client/`** (HTML/CSS/JS, Worker static assets) — GPT-like chat UI for the
   retrieval API. Supports both full (all-in-one) and staged (step-by-step)
   request modes, SSE token streaming, expandable intermediate thinking
   steps, and parameter controls for all API options.
@@ -150,15 +150,16 @@ it. This is useful for re-running a single phase after changing prompts or
 thresholds without redoing the entire pipeline.
 
 ```bash
-cd worker && npm run ingest -- --stage units      # re-detect all units
+cd worker && npm run ingest -- --stage units      # re-parse + re-detect all units (fresh job)
 cd worker && npm run ingest -- --stage summary    # re-generate summaries + embeddings
 cd worker && npm run ingest -- --stage metadata   # re-extract metadata
 cd worker && npm run ingest -- --stage relations  # re-extract relations
 ```
 
-This requires an existing job (use `--fresh` to start one first, or resume
-from a state file). The worker skips ahead to the requested phase and stops
-after it completes.
+`--stage units` re-parses the rulebook (runs the Python parser to regenerate
+structure.json), uploads it, and creates a fresh job. Other stages resume
+from the existing state file and require a prior run. The worker skips
+ahead to the requested phase and stops after it completes.
 
 **What gets cleared per stage:**
 - `units`: semantic_units, embeddings, relations, concepts, keywords (full reset, keeps structure_nodes)
@@ -166,11 +167,22 @@ after it completes.
 - `metadata`: metadata, relations, concepts, keywords; resets status to `summary_done`
 - `relations`: relations only; resets status to `metadata_done`
 
+### Clear all ingestion data
+
+To wipe all ingestion data (local state + remote DB, Vectorize, R2) without
+parsing or redeploying:
+
+```bash
+cd worker && npm run clear
+```
+
+This clears D1 tables, Vectorize vectors, and R2 objects for the document,
+plus local state files. It preserves client logs (conversations, query_logs).
+
 ### Full iteration cycle
 
-The `npm run iterate` script runs the full cycle in one command: clean local
-state, reparse `structure.json`, clean remote DB, deploy worker, start fresh
-ingestion.
+The `npm run iterate` script runs the full cycle in one command: clear,
+reparse `structure.json`, deploy worker, start fresh ingestion.
 
 ```bash
 cd worker && npm run iterate              # blocks until ingestion completes

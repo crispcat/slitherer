@@ -81,6 +81,15 @@ export async function getSemanticUnitsBySourceNode(env: Env, sourceNodeId: strin
   return (results ?? []).map(rowToUnit);
 }
 
+/** Find units with parent_unit_id = NULL that belong to a specific section path.
+ *  Used during incremental section closing to link orphan units to their section parent. */
+export async function getOrphanUnitsBySection(env: Env, sectionPath: string[]): Promise<SemanticUnit[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM semantic_units WHERE section = ? AND parent_unit_id IS NULL`
+  ).bind(JSON.stringify(sectionPath)).all();
+  return (results ?? []).map(rowToUnit);
+}
+
 export async function getUnitsByIds(env: Env, ids: string[]): Promise<SemanticUnit[]> {
   if (ids.length === 0) return [];
   const placeholders = ids.map(() => "?").join(",");
@@ -195,6 +204,58 @@ export async function getRelationsForUnits(env: Env, unitIds: string[]): Promise
 export async function getAllUnits(env: Env): Promise<SemanticUnit[]> {
   const { results } = await env.DB.prepare(`SELECT * FROM semantic_units`).all();
   return (results ?? []).map(rowToUnit);
+}
+
+/** Fetch comprehensive data for a single unit: the unit itself, its metadata,
+ *  keywords, concepts, relations (outgoing + incoming), and parent/child units.
+ *  Used by the debug tree viewer side panel. */
+export async function getUnitDetails(env: Env, unitId: string) {
+  const unit = await env.DB.prepare(`SELECT * FROM semantic_units WHERE id = ?`).bind(unitId).first();
+  if (!unit) return null;
+
+  const [keywords, concepts, relationsOut, relationsIn, parentUnit, secondaryParent, children, sourceNode] = await Promise.all([
+    env.DB.prepare(`SELECT keyword FROM keywords WHERE unit_id = ?`).bind(unitId).all(),
+    env.DB.prepare(`SELECT c.id, c.name, c.description, c.aliases FROM concepts c JOIN concept_unit cu ON cu.concept_id = c.id WHERE cu.unit_id = ?`).bind(unitId).all(),
+    env.DB.prepare(`SELECT id, target_id, relation_type, confidence FROM relations WHERE source_id = ?`).bind(unitId).all(),
+    env.DB.prepare(`SELECT id, source_id, relation_type, confidence FROM relations WHERE target_id = ?`).bind(unitId).all(),
+    unit.parent_unit_id ? env.DB.prepare(`SELECT id, name, type FROM semantic_units WHERE id = ?`).bind(unit.parent_unit_id).first() : Promise.resolve(null),
+    unit.secondary_parent_unit_id ? env.DB.prepare(`SELECT id, name, type FROM semantic_units WHERE id = ?`).bind(unit.secondary_parent_unit_id).first() : Promise.resolve(null),
+    env.DB.prepare(`SELECT id, name, type FROM semantic_units WHERE parent_unit_id = ? OR secondary_parent_unit_id = ?`).bind(unitId, unitId).all(),
+    env.DB.prepare(`SELECT id, type, section_path, page FROM structure_nodes WHERE id = ?`).bind(unit.source_node_id).first(),
+  ]);
+
+  return {
+    unit: rowToUnit(unit as any),
+    keywords: (keywords.results ?? []).map((r: any) => r.keyword),
+    concepts: (concepts.results ?? []).map((r: any) => ({ id: r.id, name: r.name, description: r.description, aliases: r.aliases })),
+    relations: {
+      outgoing: (relationsOut.results ?? []).map((r: any) => ({ id: r.id, target: r.target_id, type: r.relation_type, confidence: r.confidence })),
+      incoming: (relationsIn.results ?? []).map((r: any) => ({ id: r.id, source: r.source_id, type: r.relation_type, confidence: r.confidence })),
+    },
+    parent: parentUnit as any,
+    secondaryParent: secondaryParent as any,
+    children: (children.results ?? []).map((r: any) => ({ id: r.id, name: r.name, type: r.type })),
+    sourceNode: sourceNode as any,
+  };
+}
+
+/** List all structure nodes that have semantic units, with unit counts.
+ *  Used by the debug tree viewer to populate the source node dropdown. */
+export async function getSourceNodesWithUnits(env: Env): Promise<{ id: string; type: string; sectionPath: string; page: number | null; unitCount: number }[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT sn.id, sn.type, sn.section_path, sn.page, COUNT(su.id) as unit_count
+     FROM structure_nodes sn
+     JOIN semantic_units su ON su.source_node_id = sn.id
+     GROUP BY sn.id
+     ORDER BY sn.section_path`
+  ).all();
+  return (results ?? []).map((r: any) => ({
+    id: r.id as string,
+    type: r.type as string,
+    sectionPath: r.section_path as string,
+    page: r.page as number | null,
+    unitCount: r.unit_count as number,
+  }));
 }
 
 export async function getUnitsByStatus(env: Env, status: string, limit: number): Promise<SemanticUnit[]> {
@@ -567,4 +628,53 @@ export async function logQueryStep(
   )
     .bind(id, conversationId ?? null, step, JSON.stringify(input), JSON.stringify(output), durationMs, now)
     .run();
+}
+
+// ---- Debug logging ----
+
+export async function logDebug(
+  env: Env,
+  level: "info" | "warn" | "error",
+  source: string,
+  message: string,
+  data?: unknown
+) {
+  const id = `DLOG-${crypto.randomUUID()}`;
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO debug_logs (id, level, source, message, data, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  )
+    .bind(id, level, source, message, data ? JSON.stringify(data) : null, now)
+    .run();
+}
+
+export interface DebugLogEntry {
+  id: string;
+  level: string;
+  source: string;
+  message: string;
+  data: string | null;
+  createdAt: string;
+}
+
+export async function getDebugLogs(env: Env, since?: string, limit = 200): Promise<DebugLogEntry[]> {
+  const stmt = since
+    ? env.DB.prepare(`SELECT id, level, source, message, data, created_at FROM debug_logs WHERE created_at > ? ORDER BY created_at ASC LIMIT ?`)
+        .bind(since, limit)
+    : env.DB.prepare(`SELECT id, level, source, message, data, created_at FROM debug_logs ORDER BY created_at DESC LIMIT ?`)
+        .bind(limit);
+  const result = await stmt.all();
+  return (result.results as any[]).map((r) => ({
+    id: r.id,
+    level: r.level,
+    source: r.source,
+    message: r.message,
+    data: r.data,
+    createdAt: r.created_at,
+  }));
+}
+
+export async function clearDebugLogs(env: Env) {
+  await env.DB.prepare(`DELETE FROM debug_logs`).run();
 }

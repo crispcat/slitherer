@@ -37,7 +37,11 @@
 
   // ---- Login gate ----
 
-  const STORAGE_KEY = "slitherer_rag_auth";
+  const CFG = (typeof PAGES_CONFIG !== "undefined" && PAGES_CONFIG.client) || {};
+  const STORAGE_KEY = CFG.authStorageKey || "slitherer_rag_auth";
+  const ASSISTANT_NAME = CFG.ui?.assistantName || "SLITHERER";
+  const ASSISTANT_BADGE = CFG.ui?.assistantBadge || "S";
+  const USER_BADGE = CFG.ui?.userBadge || "U";
   const loginScreen = $("login-screen");
   const appEl = $("app");
   const loginForm = $("login-form");
@@ -285,7 +289,7 @@
     el.className = "message user";
     el.innerHTML = `
       <div class="message-header">
-        <span class="message-role-badge user">U</span>
+        <span class="message-role-badge user">${USER_BADGE}</span>
         <span>You</span>
       </div>
       <div class="message-content"></div>
@@ -306,8 +310,8 @@
     el.className = "message assistant";
     el.innerHTML = `
       <div class="message-header">
-        <span class="message-role-badge slitherer">S</span>
-        <span>SLITHERER</span>
+        <span class="message-role-badge slitherer">${ASSISTANT_BADGE}</span>
+        <span>${ASSISTANT_NAME}</span>
       </div>
       <div class="thinking-container"></div>
       <div class="message-content"></div>

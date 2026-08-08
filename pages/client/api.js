@@ -4,7 +4,8 @@
  * plus SSE streaming.
  */
 
-const DEFAULT_BASE_URL = "https://slitherer-rag.slitherer.workers.dev";
+// PAGES_CONFIG is defined in config.js (auto-generated from config/pages.yaml)
+const DEFAULT_BASE_URL = (typeof PAGES_CONFIG !== "undefined" && PAGES_CONFIG.api?.baseUrl) || "https://api.slitherer.workers.dev";
 
 /** Generate a new conversation ID. */
 function generateConversationId() {

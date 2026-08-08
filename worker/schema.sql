@@ -110,3 +110,15 @@ CREATE TABLE IF NOT EXISTS query_logs (
   FOREIGN KEY (conversation_id) REFERENCES conversations(id)
 );
 CREATE INDEX IF NOT EXISTS idx_query_logs_conversation ON query_logs(conversation_id);
+
+-- Debug logs (ingestion + retrieval pipeline events)
+
+CREATE TABLE IF NOT EXISTS debug_logs (
+  id TEXT PRIMARY KEY,
+  level TEXT NOT NULL,        -- info|warn|error
+  source TEXT NOT NULL,       -- ingestion|retrieval|router|units|summary|metadata|relations|etc.
+  message TEXT NOT NULL,
+  data TEXT,                  -- JSON: optional structured payload
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_debug_logs_created ON debug_logs(created_at);
