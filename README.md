@@ -1,6 +1,6 @@
 # AI Rulebook Knowledge Engine — MVP
 
-Implements the MVP deliverables from `docs/IMPEMENTATION_PLAN_V1.md` for the
+Implements the MVP deliverables from [IMPLEMENTATION.md](IMPLEMENTATION.md) for the
 `rulebooks/deorim_rules.docx` rulebook.
 
 ## Architecture
