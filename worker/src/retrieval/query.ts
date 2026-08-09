@@ -14,15 +14,6 @@ export interface RetrievedUnit {
   sourceSubQueries?: number[];
 }
 
-/** Minimum vector similarity for a match to be kept. */
-const SIMILARITY_THRESHOLD = RETRIEVAL.retrieval.similarityThreshold.value;
-
-/** Minimum relation confidence for graph expansion. */
-const RELATION_CONFIDENCE_THRESHOLD = RETRIEVAL.retrieval.relationConfidenceThreshold.value;
-
-/** Candidate pool per sub-query for vector search. */
-const VECTOR_CANDIDATE_POOL = RETRIEVAL.retrieval.vectorCandidatePool.value;
-
 /** Default rerank threshold if not provided by decomposer. */
 const DEFAULT_RERANK_THRESHOLD = RETRIEVAL.retrieval.defaultRerankThreshold.value;
 
@@ -42,16 +33,15 @@ async function retrieveForSubQuery(
 ): Promise<SubQueryResult> {
   const candidates = new Map<string, RetrievedUnit>();
 
-  // 3a. Vector search
+  // 3a. Vector search (top 10, no similarity threshold)
   const [queryVector] = await embed(env, [subQuery]);
   const matches = await env.VECTORIZE_INDEX.query(queryVector, {
-    topK: VECTOR_CANDIDATE_POOL,
+    topK: 10,
     returnMetadata: true,
   });
 
   const seedIds: string[] = [];
   for (const m of matches.matches ?? []) {
-    if (m.score < SIMILARITY_THRESHOLD) continue;
     if (existingIds?.has(m.id)) continue;
     seedIds.push(m.id);
     candidates.set(m.id, {
@@ -106,13 +96,12 @@ async function retrieveForSubQuery(
     }
   }
 
-  // 3c. Graph expansion (confidence-filtered)
+  // 3c. Graph expansion (2 hops)
   let frontier = [...candidates.keys()];
   for (let hop = 0; hop < graphHops && frontier.length > 0; hop++) {
     const relations = await getRelationsForUnits(env, frontier);
     const nextIds = new Set<string>();
     for (const r of relations) {
-      if (r.confidence < RELATION_CONFIDENCE_THRESHOLD) continue;
       const otherId = frontier.includes(r.source) ? r.target : r.source;
       if (!candidates.has(otherId) && !existingIds?.has(otherId)) nextIds.add(otherId);
     }

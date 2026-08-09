@@ -895,9 +895,9 @@ Step 2: Query decomposition (reasoning)
   ▼
 Step 3: Parallel retrieval (per sub-query)
   For each sub-query (in parallel):
-    3a. Vector search (topK=100, filter similarity < 0.5)
-    3b. Parent/sibling expansion (D1 column reads)
-    3c. Graph expansion (2 hops, confidence ≥ 0.5)
+    3a. Vector search (topK=10, no similarity threshold)
+    3b. Parent/sibling/children expansion (D1 column reads)
+    3c. Graph expansion (2 hops)
     Track which sub-query found each candidate.
   │
   ▼
