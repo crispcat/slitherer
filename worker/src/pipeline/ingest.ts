@@ -40,6 +40,8 @@ export interface IngestJobDetail {
   pages?: number[] | null;
   /** Continuation state passed between pages during the vision phase. */
   continuation?: VisionContinuation | null;
+  /** Last page number that was processed (for consecutive-page continuation logic). */
+  lastProcessedPage?: number | null;
 }
 
 /**
@@ -64,6 +66,7 @@ export async function startIngestion(
     unitsProcessed: 0,
     pages: pages ?? null,
     continuation: null,
+    lastProcessedPage: null,
   };
   await createIngestionJob(env, jobId, documentId);
   await updateIngestionJob(env, jobId, "vision", "running", JSON.stringify(detail));
@@ -125,11 +128,16 @@ export async function processVisionPage(
   const imageBase64 = btoa(binary);
 
   // 2. Extract units via vision model
+  // Only pass continuation state if the previous page was processed
+  // (i.e. this page is consecutive with the last processed page).
+  // Gaps in the page sequence mean the continuation would be stale/misleading.
+  const isConsecutive = detail.lastProcessedPage != null && pageNumber === detail.lastProcessedPage + 1;
+  const continuation = isConsecutive ? (detail.continuation ?? null) : null;
   const result = await extractPage(
     env,
     imageBase64,
     pageNumber,
-    detail.continuation ?? null,
+    continuation,
   );
 
   // 3. Normalize units (inherit sections from parent, map unknown types)
@@ -191,6 +199,7 @@ export async function processVisionPage(
   detail.pagesProcessed += 1;
   detail.unitsProcessed += normalized.length;
   detail.continuation = result.continuation;
+  detail.lastProcessedPage = pageNumber;
 
   // Vision is done when all enqueued pages have been processed.
   // If `pages` is set, compare against its length; otherwise compare against totalPages.
@@ -199,6 +208,7 @@ export async function processVisionPage(
   if (visionDone) {
     detail.phase = "summary";
     detail.continuation = null;
+    detail.lastProcessedPage = null;
     await logDebug(env, "info", "ingestion:vision", `Vision phase complete — transitioning to summary`, {
       totalProcessed: detail.unitsProcessed,
       totalPages: detail.totalPages,

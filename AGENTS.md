@@ -101,6 +101,7 @@ are advanced via `POST /ingest/step`:
 cd worker && npm run ingest -- --input rulebooks/deorim_rules.pdf  # full ingestion (vision + all stages)
 cd worker && npm run ingest -- --input rulebooks/deorim_rules.pdf --pages 5-10  # only pages 5-10
 cd worker && npm run ingest -- --input rulebooks/deorim_rules.pdf --pages 1,3,5-10  # specific pages
+cd worker && npm run ingest -- --input rulebooks/deorim_rules.pdf --pages 1-5 --vision-only  # vision only, skip post-vision stages
 cd worker && npm run ingest -- --stage vision     # re-run vision extraction (resets + re-enqueues pages)
 cd worker && npm run ingest -- --stage summary    # re-generate summaries + embeddings
 cd worker && npm run ingest -- --stage metadata   # re-extract metadata

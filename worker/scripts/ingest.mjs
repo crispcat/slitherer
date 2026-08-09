@@ -20,6 +20,9 @@
  *   node scripts/ingest.mjs --input ../rulebooks/deorim_rules.pdf --pages 1,3,5-10
  *   node scripts/ingest.mjs --input ../rulebooks/deorim_rules.pdf --pages 7
  *
+ *   # Stop after vision phase (skip summary/metadata/relations):
+ *   node scripts/ingest.mjs --input ../rulebooks/deorim_rules.pdf --pages 1-5 --vision-only
+ *
  *   # Run only a specific stage:
  *   node scripts/ingest.mjs --stage vision     # re-run vision extraction (re-enqueues pages)
  *   node scripts/ingest.mjs --stage summary
@@ -86,6 +89,7 @@ function parseArgs(argv) {
     statusOnly: false,
     fresh: false,
     stage: null, // null = run all stages; otherwise "vision"|"summary"|"metadata"|"relations"
+    visionOnly: false, // stop after vision phase completes
     pages: null, // null = all pages; otherwise array of 1-indexed page numbers
     apiKey: process.env.ADMIN_API_KEY ?? null,
   };
@@ -105,6 +109,7 @@ function parseArgs(argv) {
       case "--status-only": args.statusOnly = true; break;
       case "--fresh": args.fresh = true; break;
       case "--stage": args.stage = next(); break;
+      case "--vision-only": args.visionOnly = true; break;
       case "--pages": args.pages = parsePageRanges(next()); break;
       case "--api-key": args.apiKey = next(); break;
       default:
@@ -618,6 +623,13 @@ async function main() {
         lastPages = pages;
         lastUnits = units;
       }
+    } else if (args.visionOnly) {
+      // --vision-only: vision phase is done, stop without advancing to post-vision stages
+      state.finishedAt = nowIso();
+      state.totalUnits = units;
+      await saveState(state);
+      await log("DONE", "Vision phase complete (--vision-only, stopping)", state);
+      break;
     } else {
       // Post-vision phase: advance via /ingest/step
       const result = await withRetry(
