@@ -51,7 +51,7 @@ export async function checkSufficiency(
       gaps: string[];
       follow_up_queries: string[];
     }>(env, SYSTEM_PROMPT, userPrompt, {
-      model: env.ANSWER_MODEL,
+      model: env.REASONING_MODEL,
       schema: SUFFICIENCY_SCHEMA,
     });
 

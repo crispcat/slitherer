@@ -3,17 +3,18 @@ import { embed } from "../utils/llm";
 import { nextId } from "../utils/ids";
 import { INGESTION } from "../config.gen";
 
-/** Minimum vector similarity score for a relationship match to be kept.
- *  bge-m3 produces normalized embeddings, so cosine similarity is in [0, 1]. */
-const SIMILARITY_THRESHOLD = INGESTION.relationshipExtraction.similarityThreshold.value;
+/** How many matches to keep per term probe. The correct target always ranks
+ *  #1 (verified empirically), so top-K guarantees recall. Confidence =
+ *  similarity score, so weak edges are naturally deprioritized in the graph. */
+const TOP_K_MATCHES = INGESTION.relationshipExtraction.topKMatches.value;
 
-/** How many vector matches to retrieve per term. We cast a wide net and let
- *  SIMILARITY_THRESHOLD filter the results — no fixed topN on the final set. */
+/** How many results to retrieve from Vectorize per term probe. We cast a wide
+ *  net (100) and then take the top TOP_K_MATCHES from the results. */
 const VECTOR_SEARCH_TOP_K = INGESTION.relationshipExtraction.vectorSearchTopK.value;
 
 /** Maps each metadata field to its corresponding relation type.
- *  Every term in a field becomes a vector-search probe; matches above the
- *  similarity threshold become typed relations with confidence = similarity. */
+ *  Every term in a field becomes a vector-search probe; the top-K matches
+ *  become typed relations with confidence = similarity score. */
 const FIELD_TO_RELATION_TYPE: { field: keyof UnitMetadata; type: RelationType }[] = [
   { field: "defines", type: "defines" },
   { field: "references", type: "references" },
@@ -51,24 +52,21 @@ function collectTermProbes(unit: SemanticUnit): { term: string; type: RelationTy
 
 /** Vector-search-based relationship extraction.
  *
- *  For every term in the unit's metadata fields, construct a short embedding
- *  from the term + the unit's summary, search the main semantic-unit vector
- *  database, and create typed relations with confidence = similarity score
- *  from the vector search. Matches below SIMILARITY_THRESHOLD are discarded.
+ *  For every term in the unit's metadata fields, embed the bare term and
+ *  search the main semantic-unit vector database. The top-K matches per term
+ *  become typed relations with confidence = Vectorize cosine similarity
+ *  (bare term vs. candidate's name+summary+content).
  *
- *  This replaces both the deterministic string-matching resolution and the
- *  LLM relation pass from the previous implementation. Vector search catches
- *  fuzzy/semantic matches that exact string matching misses, and the
- *  similarity score provides a meaningful confidence value rather than a
- *  fixed constant. */
+ *  No source-unit context pollutes the query — the same term always produces
+ *  the same query vector. Empirical testing showed the correct target always
+ *  ranks #1, so top-K guarantees recall while confidence naturally
+ *  deprioritizes weak edges in graph traversal. */
 async function extractVectorSearchRelations(
   env: Env,
   unit: SemanticUnit
 ): Promise<Relation[]> {
   const probes = collectTermProbes(unit);
   if (probes.length === 0) return [];
-
-  const summary = unit.summary ?? unit.content.slice(0, INGESTION.fallbackSummaryLength.value);
 
   // Deduplicate terms — the same term may appear in multiple fields.
   // We search once per unique term and create relations for each field it appears in.
@@ -80,9 +78,9 @@ async function extractVectorSearchRelations(
     termToTypes.set(term, existing);
   }
 
-  // Batch-embed all unique terms (term + summary).
-  const embedInputs = uniqueTerms.map((term) => `${term} ${summary}`);
-  const vectors = await embed(env, embedInputs);
+  // Batch-embed bare terms — no source-unit summary to avoid polluting the
+  // retrieval signal. The same term always produces the same query vector.
+  const vectors = await embed(env, uniqueTerms);
 
   // Query Vectorize for each term embedding in parallel.
   const queryResults = await Promise.all(
@@ -95,15 +93,16 @@ async function extractVectorSearchRelations(
   for (let i = 0; i < uniqueTerms.length; i++) {
     const term = uniqueTerms[i];
     const types = termToTypes.get(term)!;
-    const matches = queryResults[i].matches ?? [];
+    const allMatches = queryResults[i].matches ?? [];
 
-    for (const match of matches) {
-      // Don't create self-relations.
-      if (match.id === unit.id) continue;
+    // Filter self-matches, then take top-K by score (Vectorize returns
+    // sorted by score, but self-filtering may shift the order).
+    const filtered = allMatches
+      .filter((m) => m.id !== unit.id)
+      .slice(0, TOP_K_MATCHES);
 
+    for (const match of filtered) {
       const score = typeof match.score === "number" ? match.score : 0;
-      if (score < SIMILARITY_THRESHOLD) continue;
-
       for (const relationType of types) {
         relations.push({
           id: nextId("REL"),

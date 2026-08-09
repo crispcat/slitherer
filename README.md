@@ -1,56 +1,47 @@
 # AI Rulebook Knowledge Engine — MVP
 
 Implements the MVP deliverables from [IMPLEMENTATION.md](IMPLEMENTATION.md) for the
-`rulebooks/deorim_rules.docx` rulebook.
+`rulebooks/deorim_rules.pdf` rulebook.
 
 ## Architecture
 
-- **`parser/`** (Python, local, no AI) — Phase 1 (DOCX -> Markdown) and Phase 2
-  (Markdown -> hierarchical `structure.json`). This document has no Word
-  heading styles, so headings are detected from numbering conventions
-  (`I.`, `2.1.`, `2.1.1.` etc. -> chapter/section/subsection); page numbers
-  come from Word's cached `<w:lastRenderedPageBreak/>` markers.
-- **`worker/`** (TypeScript, Cloudflare Workers) — Phases 3-9: semantic unit
-  detection/splitting, metadata extraction, relationship extraction,
-  embedding generation, D1 knowledge graph, agentic retrieval (router →
-  decompose → retrieve → sufficiency loop → answer), and citation-aware
-  answer generation. Uses Workers AI (`AI` binding), Vectorize, D1, and R2.
+- **`worker/`** (TypeScript, Cloudflare Workers) — Phases 1-5: vision extraction
+  (page images → semantic units via vision-language model), summary + embeddings,
+  metadata extraction (LLM), relationship extraction (vector search + deterministic
+  hierarchy). Phases 6-8: agentic retrieval (router → decompose → retrieve →
+  sufficiency loop → answer), citation-aware answer generation. Uses Workers AI
+  (`AI` binding), Vectorize, D1, R2, and Queues.
 - **`pages/client/`** (HTML/CSS/JS, Worker static assets) — GPT-like chat UI for the
   retrieval API. Supports both full (all-in-one) and staged (step-by-step)
   request modes, SSE token streaming, expandable intermediate thinking
   steps, and parameter controls for all API options.
+- **`pages/debug/`** (HTML/CSS/JS, D3.js, Worker static assets) — Debug tree viewer
+  for inspecting the semantic unit hierarchy, metadata, and relations.
 - **`config/`** (YAML) — Externalized configuration for all pipeline values,
   prompts, model references, and thresholds. Read at build time by
   `gen-config.mjs` to generate `worker/src/config.gen.ts`.
 
 ## Known MVP limitations
 
-- The local heading heuristic also matches the book's table-of-contents
-  entries (they reuse the same numbering scheme), producing some duplicate
-  early nodes. Harmless for the pipeline; can be filtered by section-page
-  monotonicity if it becomes an issue.
-- Ingestion runs as four sequential whole-document phases (units -> metadata
-  -> relations -> embeddings), each only starting once the previous phase
-  has processed every node/unit. This means Phase 5 relationship extraction
-  always sees the complete knowledge base as candidates (forward and
-  backward references alike) — no separate rebuild pass needed for a fresh
-  ingest. `POST /ingest/rebuild-relations` still exists as a utility for
-  incremental updates, to let older units reconsider newly changed ones.
-- Ingestion is chunked into batches (see `/ingest/step`) to stay within a
-  single Worker invocation's CPU budget — a ~200 page book requires many
-  step calls (LLM call per unit x 2-3 pipeline phases).
+- Ingestion runs as four sequential phases (vision → summary → metadata →
+  relations), each only starting once the previous phase has processed every
+  unit. The vision phase is Queue-driven (one page at a time, max_concurrency=1);
+  post-vision phases are advanced via `POST /ingest/step` in batches.
+- Ingestion is chunked into batches to stay within a single Worker invocation's
+  CPU budget — a ~200 page book requires many step calls (LLM call per unit
+  × 2-3 pipeline phases).
 
-## 1. Run the parser
+## 1. Install system dependencies
+
+The ingest script uses `pdftoppm` and `pdfinfo` (from poppler-utils) to render
+PDF pages to PNG images. Install them if not already available:
 
 ```bash
-cd parser
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python docx_to_markdown.py ../rulebooks/deorim_rules.docx -o ../rulebooks/deorim_rules.md
-.venv/bin/python markdown_to_structure.py ../rulebooks/deorim_rules.md -o ../rulebooks/deorim_rules.structure.json
+# Debian/Ubuntu
+sudo apt install poppler-utils
+# macOS
+brew install poppler
 ```
-
-Produces `rulebooks/deorim_rules.md` and `rulebooks/deorim_rules.structure.json`
-(the Phase 2 node tree consumed by the Worker).
 
 ## 2. Provision Cloudflare resources
 
@@ -62,6 +53,7 @@ npm install
 npx wrangler d1 create slitherer-rag-db          # copy the database_id into wrangler.toml
 npx wrangler vectorize create slitherer-rag-units --dimensions=1024 --metric=cosine
 npx wrangler r2 bucket create slitherer-rag-storage
+npx wrangler queues create vision-ingest          # Queue for vision pipeline
 npm run db:migrate:remote                         # applies schema.sql
 ```
 
@@ -102,33 +94,40 @@ config files in `config/` and generates `worker/src/config.gen.ts`. See the
 
 ## 4. Ingest the rulebook
 
-Use `npm run ingest` to drive ingestion. It first uploads `structure.json`
-(plus `sourcePath`) to R2 via `POST /ingest/upload`, then calls `POST /ingest`
-with the returned `bucketKey` and loops `/ingest/step`. Uploading to R2 first
-(rather than inlining the JSON in the request body) is always automatic — no
-manual step or size caveat to worry about. It also tracks stage/progress,
-persists a resumable state file (`.ingest-state.json` by default), and retries
-transient errors with backoff while logging full error details to `ingest.log`.
+Use `npm run ingest` to drive the vision-based ingestion pipeline. The script:
+
+1. Renders PDF pages to PNG images (via PyMuPDF, 200 DPI)
+2. Uploads page images to R2 (`pages/{documentId}/{page}.png`) via `PUT /ingest/r2/{key}`
+   — unchanged images are skipped via hash check
+3. Calls `POST /ingest` to enqueue all pages to the vision Queue
+4. Polls `GET /ingest/status` until the vision phase completes
+5. Drives post-vision phases (summary → metadata → relations) via `POST /ingest/step`
+
+It tracks stage/progress, persists a resumable state file (`.ingest-state.json`),
+and retries transient errors with backoff while logging to `ingest.log`.
 
 ```bash
 cd worker
 ADMIN_API_KEY=<your-secret> npm run ingest -- \
   --url https://<your-worker>.workers.dev \
-  --structure ../rulebooks/deorim_rules.structure.json \
+  --input ../rulebooks/deorim_rules.pdf \
   --document-id deorim_rules \
-  --source-path rulebooks/deorim_rules.docx
+  --source-path rulebooks/deorim_rules.pdf
 ```
 
-(or pass `--api-key <your-secret>` instead of the env var.)
+(or pass `--api-key <your-secret>` instead of the env var. The API key is also
+read from `worker/.dev.vars` if present.)
 
 Output looks like:
 
 ```
+[...] [STAGE] Rendering PDF pages to PNG...
+[...] [STAGE] Page images uploaded
 [...] [STAGE] Starting ingestion job {...}
-[...] [STAGE] Entered phase: units
-[...] [PROGRESS] phase=units unitsProcessed=12 remaining=?
-[...] [STAGE] Entered phase: metadata
-[...] [PROGRESS] phase=metadata unitsProcessed=340 remaining=298 (12.4% of this phase)
+[...] [STAGE] Enqueued N pages to vision Queue
+[...] [PROGRESS] phase=vision pagesProcessed=42/N
+[...] [STAGE] Vision phase complete — transitioning to summary
+[...] [PROGRESS] phase=summary unitsProcessed=340
 ...
 [...] [DONE] Ingestion complete {...}
 ```
@@ -138,8 +137,28 @@ re-run the same command — it resumes from the exact job/phase recorded in
 `.ingest-state.json` instead of restarting. Use `--fresh` to force a brand
 new job, or `--status-only` to just print the current job status.
 
-Other useful flags: `--batch-size <n>` (nodes/units per step, default 5),
-`--max-retries <n>` (default 5), `--poll-delay-ms <n>` (default 200).
+Other useful flags: `--skip-parse` (skip parsing, use existing output),
+`--skip-upload` (skip uploading to R2), `--max-retries <n>` (default 5),
+`--poll-delay-ms <n>` (default 1000), `--pages <ranges>` (only ingest specific
+pages, e.g. `--pages 5-10` or `--pages 1,3,5-10`).
+
+### Ingesting specific pages
+
+The `--pages` flag limits the vision stage to a subset of pages. Only the
+specified pages are rendered, uploaded to R2, and enqueued to the vision
+Queue. This is useful for testing the vision pipeline on a few pages without
+ingesting the full document.
+
+```bash
+cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --pages 5-10
+cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --pages 1,3,5-10
+cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --pages 7
+```
+
+The page range syntax supports comma-separated ranges: `5-10` (pages 5
+through 10), `1,3,5-10` (pages 1, 3, and 5 through 10), `7` (just page 7).
+Post-vision stages (summary, metadata, relations) always process all units
+in the database regardless of the `--pages` filter.
 
 ### Run a single ingestion stage
 
@@ -150,21 +169,22 @@ it. This is useful for re-running a single phase after changing prompts or
 thresholds without redoing the entire pipeline.
 
 ```bash
-cd worker && npm run ingest -- --stage units      # re-parse + re-detect all units (fresh job)
-cd worker && npm run ingest -- --stage summary    # re-generate summaries + embeddings
-cd worker && npm run ingest -- --stage metadata   # re-extract metadata
-cd worker && npm run ingest -- --stage relations  # re-extract relations
+cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --stage vision     # re-run vision extraction (resets + re-enqueues pages)
+cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --stage summary    # re-generate summaries + embeddings
+cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --stage metadata   # re-extract metadata
+cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --stage relations  # re-extract relations
 ```
 
-`--stage units` re-parses the rulebook (runs the Python parser to regenerate
-structure.json), uploads it, and creates a fresh job. Other stages resume
-from the existing state file and require a prior run. The worker skips
-ahead to the requested phase and stops after it completes.
+`--stage vision` resets the vision phase and re-enqueues all existing page
+images to the vision Queue (it does NOT re-parse or re-upload — use a full
+`npm run ingest` for that). Other stages also resume from the existing
+state file and require a prior run. The worker skips ahead to the requested
+phase and stops after it completes.
 
 **What gets cleared per stage:**
-- `units`: semantic_units, embeddings, relations, concepts, keywords (full reset, keeps structure_nodes)
-- `summary`: summaries, embeddings, metadata, relations, concepts, keywords; resets status to `pending`
-- `metadata`: metadata, relations, concepts, keywords; resets status to `summary_done`
+- `vision`: semantic_units, embeddings, relations; resets job to vision phase and re-enqueues pages
+- `summary`: summaries, embeddings, metadata, relations; resets status to `pending`
+- `metadata`: metadata, relations; resets status to `summary_done`
 - `relations`: relations only; resets status to `metadata_done`
 
 ### Clear all ingestion data
@@ -176,19 +196,10 @@ parsing or redeploying:
 cd worker && npm run clear
 ```
 
-This clears D1 tables, Vectorize vectors, and R2 objects for the document,
-plus local state files. It preserves client logs (conversations, query_logs).
-
-### Full iteration cycle
-
-The `npm run iterate` script runs the full cycle in one command: clear,
-reparse `structure.json`, deploy worker, start fresh ingestion.
-
-```bash
-cd worker && npm run iterate              # blocks until ingestion completes
-cd worker && npm run iterate -- --no-watch # starts ingestion in background
-cd worker && npm run iterate -- --stage metadata  # iterate but only run metadata phase
-```
+This clears D1 tables, Vectorize vectors, and R2 job/structure files for the
+document, plus local state files. It preserves R2 page images (reused on the
+next ingest — the ingest script skips re-uploading unchanged files via hash
+check). It preserves client logs (conversations, query_logs).
 
 ## 5. Query
 
@@ -202,11 +213,10 @@ Returns `{ answer, citations, usedUnitIds, retrievedUnits }`.
 
 ## Incremental updates
 
-Re-run the parser on an updated DOCX, then POST the new `structure.json` to
-`/ingest` again with the same `documentId`. `processIngestionBatch` hashes
-each structure node's content and skips re-running Phases 3-7 for any node
-whose semantic units already have a matching `content_hash`, only
-reprocessing (and re-embedding/re-graphing) changed nodes.
+To re-ingest after changes to the source document, run `npm run clear` to
+wipe the old data, then `npm run ingest` with the updated input file. The
+vision pipeline does not currently support incremental/delta updates —
+each ingestion is a full re-run of all phases.
 
 ## Configuration
 
@@ -215,7 +225,8 @@ externalized into YAML files under `config/`:
 
 - `config/ingestion.yaml` — pipeline thresholds, batch sizes, LLM temperatures, all ingestion prompts
 - `config/retrieval.yaml` — retrieval thresholds, graph hops, all retrieval prompts
-- `config/client.yaml` — CORS settings, UI feature flags
+- `config/pages.yaml` — client/debug site URLs, UI feature flags
+- `config/worker.yaml` — worker URL, CORS headers
 
 A build-time codegen script (`worker/scripts/gen-config.mjs`) reads the YAML
 and generates `worker/src/config.gen.ts` (gitignored), which is imported by

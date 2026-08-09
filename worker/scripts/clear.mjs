@@ -73,7 +73,8 @@ console.log(cleanupResp.trim());
 // ---- 3/3: Summary ----
 step(3, 3, "Clear complete");
 console.log(`Document: ${DOCUMENT_ID}`);
-console.log("Cleared: local state, D1 tables, Vectorize vectors, R2 objects");
+console.log("Cleared: local state, D1 tables, Vectorize vectors, R2 job/structure files");
+console.log("Preserved: R2 page images (reused on next ingest)");
 console.log("Preserved: conversations, query_logs, debug_logs (client/pipeline logs)");
 
 console.log("\n=== Done ===");

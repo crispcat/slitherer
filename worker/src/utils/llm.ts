@@ -2,7 +2,7 @@ import type { Env } from "../types";
 import { jsonrepair } from "jsonrepair";
 import { INGESTION, RETRIEVAL } from "../config.gen";
 
-function extractJsonBlock(text: string): string {
+export function extractJsonBlock(text: string): string {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenced) return fenced[1].trim();
   const first = text.indexOf("{");
@@ -68,15 +68,27 @@ export async function llmJson<T>(
 }
 
 /** Free-form text completion (used for answer generation). */
-export async function llmText(env: Env, system: string, user: string, model?: string): Promise<string> {
+export async function llmText(
+  env: Env,
+  system: string,
+  user: string,
+  modelOrOpts?: string | { model?: string; temperature?: number },
+): Promise<string> {
+  const model = typeof modelOrOpts === "string" ? modelOrOpts : modelOrOpts?.model;
+  const temperature = typeof modelOrOpts === "object" ? modelOrOpts?.temperature : undefined;
   const res: any = await env.AI.run((model ?? env.ANSWER_MODEL) as any, {
     messages: [
       { role: "system", content: system },
       { role: "user", content: user },
     ],
-    temperature: INGESTION.llm.textTemperature.value,
+    temperature: temperature ?? INGESTION.llm.textTemperature.value,
   });
-  return typeof res === "string" ? res : res.response ?? "";
+  if (typeof res === "string") return res;
+  if (typeof res?.response === "string") return res.response;
+  // Some models return the result in res.response as an object or in res directly.
+  // Try to stringify whatever we got.
+  if (res?.response && typeof res.response === "object") return JSON.stringify(res.response);
+  return JSON.stringify(res);
 }
 
 export async function embed(env: Env, texts: string[]): Promise<number[][]> {

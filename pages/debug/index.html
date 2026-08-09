@@ -38,12 +38,6 @@
   #status { font-size: 12px; color: #a0a0b0; margin-left: auto; }
   #tree-container { margin-top: 60px; width: 100%; height: calc(100vh - 60px); overflow: auto; }
   svg { width: 100%; min-height: 100%; display: block; }
-  .node circle { fill: #e94560; stroke: #fff; stroke-width: 1.5px; cursor: pointer; }
-  .node.collapsed circle { fill: #0f3460; stroke: #e94560; }
-  .node.has-comment circle { stroke: #f9a825; stroke-width: 3px; }
-  .node text { font-size: 11px; fill: #e0e0e0; pointer-events: none; }
-  .node text.comment-badge { fill: #f9a825; font-weight: bold; font-size: 14px; pointer-events: none; }
-  .link { fill: none; stroke: #0f3460; stroke-width: 1.5px; }
   .node-tooltip { position: fixed; background: #16213e; border: 1px solid #0f3460; padding: 10px 14px; border-radius: 6px; font-size: 12px; max-width: 400px; pointer-events: none; z-index: 20; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
   .node-tooltip strong { color: #e94560; }
   .node-tooltip .meta { color: #a0a0b0; margin-top: 4px; }
@@ -116,6 +110,17 @@
   #debug-toggle:hover { background: #1a1a5e; }
   #debug-toggle.active { border-color: #e94560; color: #e94560; }
 
+  /* Unit edit form (in side panel) */
+  .sp-edit-form { margin-top: 12px; }
+  .sp-edit-form .form-field { margin-bottom: 10px; }
+  .sp-edit-form label { display: block; font-size: 11px; color: #a0a0b0; margin-bottom: 4px; text-transform: uppercase; }
+  .sp-edit-form input, .sp-edit-form textarea, .sp-edit-form select { width: 100%; background: #0f3460; border: 1px solid #1a1a4e; color: #e0e0e0; padding: 6px 10px; border-radius: 4px; font-size: 12px; font-family: inherit; }
+  .sp-edit-form textarea { resize: vertical; min-height: 80px; }
+  .sp-edit-form button { background: #e94560; border: none; color: #fff; padding: 8px 16px; border-radius: 4px; font-size: 12px; cursor: pointer; font-weight: 600; }
+  .sp-edit-form button:hover { background: #c81e4a; }
+  .sp-edit-form .edit-cancel { background: #1a1a4e; border: 1px solid #1a1a4e; color: #a0a0b0; margin-left: 8px; }
+  .sp-edit-form .edit-cancel:hover { background: #1a1a5e; }
+
   /* Boxes diagram */
   .box-cell rect { stroke: #0f3460; stroke-width: 2px; rx: 4px; ry: 4px; cursor: pointer; }
   .box-cell rect.box-Table { fill: #1a2a4e; stroke: #4e7eff; }
@@ -173,16 +178,6 @@
     <label>Type:</label>
     <select id="type-filter">
       <option value="">All types</option>
-    </select>
-    <label>Parent:</label>
-    <select id="parent-mode">
-      <option value="primary">Primary</option>
-      <option value="secondary">Secondary</option>
-    </select>
-    <label>Diagram:</label>
-    <select id="diagram-mode">
-      <option value="boxes">Boxes</option>
-      <option value="tree">Tree</option>
     </select>
     <button id="export-btn" title="Export comments as JSON">Export</button>
     <button id="import-btn" title="Import comments from JSON">Import</button>
@@ -258,8 +253,6 @@ let allRoots = null;
 let allFlatUnits = null;
 let currentRoot = null;
 let currentSourceId = "";
-let parentMode = "primary";
-let diagramMode = "boxes";
 let comments = {};
 let contextMenuNode = null;
 let collapsedNodeIds = new Set(); // track collapsed box nodes by ID for refresh
@@ -354,18 +347,6 @@ document.getElementById("source-select").addEventListener("change", () => {
   currentSourceId = document.getElementById("source-select").value;
   loadTree();
 });
-document.getElementById("parent-mode").addEventListener("change", () => {
-  parentMode = document.getElementById("parent-mode").value;
-  if (allFlatUnits) {
-    allRoots = buildTree(allFlatUnits, parentMode);
-    rerender();
-  }
-});
-document.getElementById("diagram-mode").addEventListener("change", () => {
-  diagramMode = document.getElementById("diagram-mode").value;
-  savedZoomTransform = null;
-  rerender();
-});
 document.getElementById("export-btn").addEventListener("click", exportComments);
 document.getElementById("import-btn").addEventListener("click", () => document.getElementById("import-file").click());
 document.getElementById("import-file").addEventListener("change", importComments);
@@ -450,11 +431,10 @@ async function fetchDebugLogs() {
 }
 
 document.getElementById("debug-toggle").addEventListener("click", toggleDebugPanel);
-document.getElementById("debug-close-btn").addEventListener("click", () => {
-  document.getElementById("debug-panel").classList.remove("open");
-  document.getElementById("debug-toggle").classList.remove("active");
-  stopDebugLogPolling();
-});
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
 document.getElementById("debug-pause-btn").addEventListener("click", (e) => {
   debugLogPaused = !debugLogPaused;
   e.target.textContent = debugLogPaused ? "Resume" : "Pause";
@@ -504,7 +484,7 @@ async function loadTree() {
     if (!res.ok) { const body = await res.text(); throw new Error(`HTTP ${res.status}: ${body}`); }
     const data = await res.json();
     allFlatUnits = data.units || [];
-    allRoots = buildTree(allFlatUnits, parentMode);
+    allRoots = buildTree(allFlatUnits);
     status.textContent = `Loaded ${allFlatUnits.length} units (${allRoots.length} roots)`;
 
     // Populate type filter
@@ -517,8 +497,7 @@ async function loadTree() {
       typeSelect.appendChild(opt);
     }
 
-    if (diagramMode === "boxes") renderBoxes(allRoots);
-    else renderTree(allRoots);
+    renderBoxes(allRoots);
   } catch (err) {
     status.textContent = `Error: ${err.message}`;
     console.error(err);
@@ -544,7 +523,7 @@ async function refreshTree() {
     const panelScroll = document.getElementById("side-panel-body")?.scrollTop;
 
     allFlatUnits = newFlatUnits;
-    allRoots = buildTree(allFlatUnits, parentMode);
+    allRoots = buildTree(allFlatUnits);
 
     // Re-populate type filter if types changed
     const types = new Set(allFlatUnits.map((u) => u.type).filter(Boolean));
@@ -573,8 +552,7 @@ async function refreshTree() {
     const filter = document.getElementById("filter-input").value;
     const typeFilter = document.getElementById("type-filter").value;
     if (filter || typeFilter) applyFilter();
-    else if (diagramMode === "boxes") renderBoxes(allRoots);
-    else renderTree(allRoots);
+    else renderBoxes(allRoots);
 
     // Restore scroll positions
     window.scrollTo(scrollX, scrollY);
@@ -621,13 +599,14 @@ function stopAutoRefresh() {
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
 }
 
-function buildTree(flat, mode) {
-  const parentKey = mode === "secondary" ? "secondaryParentId" : "parentId";
+function buildTree(flat) {
+  const parentKey = "parentId";
   const byId = new Map(flat.map((u) => [u.id, { ...u, children: [] }]));
   const roots = [];
   for (const u of byId.values()) {
     const pid = u[parentKey];
-    if (pid && byId.has(pid)) {
+    // Guard against self-parenting (cycles break D3 tree layout)
+    if (pid && pid !== u.id && byId.has(pid)) {
       byId.get(pid).children.push(u);
     } else {
       roots.push(u);
@@ -648,124 +627,8 @@ function rerender() {
     const filter = document.getElementById("filter-input").value;
     const typeFilter = document.getElementById("type-filter").value;
     if (filter || typeFilter) applyFilter();
-    else if (diagramMode === "boxes") renderBoxes(allRoots);
-    else renderTree(allRoots);
+    else renderBoxes(allRoots);
   }
-}
-
-// ---- Tree rendering ----
-let savedZoomTransform = null;
-
-function renderTree(roots) {
-  const svg = d3.select("#tree-svg");
-  const prevTransform = savedZoomTransform;
-  svg.selectAll("*").remove();
-  svg.style("margin", "").style("display", "");
-
-  const width = window.innerWidth;
-  const height = window.innerHeight - 60;
-  const g = svg.append("g");
-
-  const zoom = d3.zoom().scaleExtent([0.1, 3]).on("zoom", (e) => { savedZoomTransform = e.transform; g.attr("transform", e.transform); });
-  svg.call(zoom);
-
-  let treeData;
-  if (roots.length === 1) treeData = roots[0];
-  else treeData = { id: "__root__", name: "ROOT", type: "root", children: roots };
-
-  currentRoot = d3.hierarchy(treeData);
-  const treeLayout = d3.tree().nodeSize([60, 80]);
-  drawTree(g, currentRoot, treeLayout, height, width);
-  if (prevTransform) {
-    svg.call(zoom.transform, prevTransform);
-  } else {
-    svg.call(zoom.transform, d3.zoomIdentity.translate(40, 40));
-  }
-}
-
-function drawTree(g, root, treeLayout, height, width) {
-  treeLayout(root);
-
-  const svgEl = g.node().ownerSVGElement;
-  if (svgEl) {
-    const xExtent = d3.extent(root.descendants(), (d) => d.x);
-    const yExtent = d3.extent(root.descendants(), (d) => d.y);
-    const xMin = xExtent[0] ?? 0;
-    const xMax = xExtent[1] ?? 0;
-    const yMax = yExtent[1] ?? 0;
-    d3.select(svgEl).style("width", (xMax - xMin + 80) + "px").style("height", (yMax + 80) + "px");
-  }
-
-  g.selectAll(".link").data(root.links(), (d) => d.target.data.id)
-    .enter().append("path").attr("class", "link")
-    .attr("d", d3.linkVertical().x((d) => d.x).y((d) => d.y));
-
-  const node = g.selectAll(".node").data(root.descendants(), (d) => d.data.id)
-    .enter().append("g")
-    .attr("class", (d) => "node" + (hasComment(d.data.id) ? " has-comment" : "") + (d._children ? " collapsed" : ""))
-    .attr("transform", (d) => `translate(${d.x},${d.y})`)
-    .on("mouseover", showTooltip).on("mouseout", hideTooltip)
-    .on("click", (event, d) => {
-      if (event.shiftKey) { openCommentModal(d.data); return; }
-      openSidePanel(d.data.id);
-    })
-    .on("dblclick", (event, d) => {
-      event.stopPropagation();
-      if (d.children) { d._children = d.children; d.children = null; }
-      else if (d._children) { d.children = d._children; d._children = null; }
-      updateTree(g, root, treeLayout, height, width);
-    })
-    .on("contextmenu", (event, d) => { event.preventDefault(); contextMenuNode = d; showContextMenu(event, d); });
-
-  node.append("circle").attr("r", 5);
-  node.filter((d) => hasComment(d.data.id))
-    .append("text").attr("class", "comment-badge").attr("dy", -8).attr("text-anchor", "middle").text("\u270D");
-}
-
-function updateTree(g, root, treeLayout, height, width) {
-  treeLayout(root);
-
-  const svgEl = g.node().ownerSVGElement;
-  if (svgEl) {
-    const xExtent = d3.extent(root.descendants(), (d) => d.x);
-    const yExtent = d3.extent(root.descendants(), (d) => d.y);
-    const xMin = xExtent[0] ?? 0;
-    const xMax = xExtent[1] ?? 0;
-    const yMax = yExtent[1] ?? 0;
-    d3.select(svgEl).style("width", (xMax - xMin + 80) + "px").style("height", (yMax + 80) + "px");
-  }
-
-  const link = g.selectAll(".link").data(root.links(), (d) => d.target.data.id);
-  link.exit().remove();
-  link.enter().append("path").attr("class", "link")
-    .attr("d", d3.linkVertical().x((d) => d.x).y((d) => d.y))
-    .merge(link).attr("d", d3.linkVertical().x((d) => d.x).y((d) => d.y));
-
-  const node = g.selectAll(".node").data(root.descendants(), (d) => d.data.id);
-  node.exit().remove();
-  const nodeEnter = node.enter().append("g")
-    .attr("class", (d) => "node" + (hasComment(d.data.id) ? " has-comment" : "") + (d._children ? " collapsed" : ""))
-    .attr("transform", (d) => `translate(${d.x},${d.y})`)
-    .on("mouseover", showTooltip).on("mouseout", hideTooltip)
-    .on("click", (event, d) => {
-      if (event.shiftKey) { openCommentModal(d.data); return; }
-      openSidePanel(d.data.id);
-    })
-    .on("dblclick", (event, d) => {
-      event.stopPropagation();
-      if (d.children) { d._children = d.children; d.children = null; }
-      else if (d._children) { d.children = d._children; d._children = null; }
-      updateTree(g, root, treeLayout, height, width);
-    })
-    .on("contextmenu", (event, d) => { event.preventDefault(); contextMenuNode = d; showContextMenu(event, d); });
-
-  nodeEnter.append("circle").attr("r", 5);
-  nodeEnter.filter((d) => hasComment(d.data.id))
-    .append("text").attr("class", "comment-badge").attr("dy", -8).attr("text-anchor", "middle").text("\u270D");
-
-  nodeEnter.merge(node)
-    .attr("class", (d) => "node" + (hasComment(d.data.id) ? " has-comment" : "") + (d._children ? " collapsed" : ""))
-    .attr("transform", (d) => `translate(${d.x},${d.y})`);
 }
 
 // ---- Boxes rendering ----
@@ -1031,22 +894,6 @@ function renderSidePanel(data) {
     sections.push(`<div class="sp-section"><div class="sp-section-title">Metadata</div>${mdTags}</div>`);
   }
 
-  // Keywords
-  if (data.keywords && data.keywords.length > 0) {
-    sections.push(`
-      <div class="sp-section">
-        <div class="sp-section-title">Keywords</div>
-        <div class="sp-field-value">${data.keywords.map(escapeHtml).map(k => `<span class="sp-tag">${k}</span>`).join("")}</div>
-      </div>
-    `);
-  }
-
-  // Concepts
-  if (data.concepts && data.concepts.length > 0) {
-    const concepts = data.concepts.map(c => `<div class="sp-rel-item"><strong>${escapeHtml(c.name)}</strong>${c.description ? `<br><span style="color:#a0a0b0">${escapeHtml(c.description)}</span>` : ""}</div>`).join("");
-    sections.push(`<div class="sp-section"><div class="sp-section-title">Concepts</div>${concepts}</div>`);
-  }
-
   // Relations — outgoing
   if (data.relations && data.relations.outgoing && data.relations.outgoing.length > 0) {
     const rels = data.relations.outgoing.map(r => `<div class="sp-rel-item"><span class="sp-rel-type">${r.type}</span> &rarr; <span class="sp-rel-target">${r.target}</span> <span style="color:#a0a0b0">(conf: ${r.confidence})</span></div>`).join("");
@@ -1062,7 +909,6 @@ function renderSidePanel(data) {
   // Hierarchy
   const hierParts = [];
   if (data.parent) hierParts.push(`<div class="sp-field"><span class="sp-field-label">Parent</span><span class="sp-field-value">${data.parent.id} (${data.parent.type})${data.parent.name ? " — " + escapeHtml(data.parent.name) : ""}</span></div>`);
-  if (data.secondaryParent) hierParts.push(`<div class="sp-field"><span class="sp-field-label">Sec. Parent</span><span class="sp-field-value">${data.secondaryParent.id} (${data.secondaryParent.type})${data.secondaryParent.name ? " — " + escapeHtml(data.secondaryParent.name) : ""}</span></div>`);
   if (data.children && data.children.length > 0) {
     const childrenList = data.children.map(c => `<span class="sp-tag">${c.id} (${c.type})</span>`).join("");
     hierParts.push(`<div class="sp-field"><span class="sp-field-label">Children (${data.children.length})</span><span class="sp-field-value">${childrenList}</span></div>`);
@@ -1095,7 +941,67 @@ function renderSidePanel(data) {
     sections.push(`<div class="sp-section"><div class="sp-section-title">Comment</div><div class="sp-summary" style="color:#f9a825">${escapeHtml(comment)}</div></div>`);
   }
 
+  // Edit form
+  sections.push(`
+    <div class="sp-section">
+      <div class="sp-section-title">Edit Unit</div>
+      <div class="sp-edit-form">
+        <div class="form-field">
+          <label>Type</label>
+          <select id="edit-type">
+            <option value="Rule" ${u.type === "Rule" ? "selected" : ""}>Rule</option>
+            <option value="Table" ${u.type === "Table" ? "selected" : ""}>Table</option>
+          </select>
+        </div>
+        <div class="form-field">
+          <label>Name</label>
+          <input type="text" id="edit-name" value="${escapeHtml(u.name || "")}" />
+        </div>
+        <div class="form-field">
+          <label>Section (comma-separated path)</label>
+          <input type="text" id="edit-section" value="${(u.section || []).join(", ")}" />
+        </div>
+        <div class="form-field">
+          <label>Parent Unit ID</label>
+          <input type="text" id="edit-parent-id" value="${u.parentUnitId || ""}" />
+        </div>
+        <div class="form-field">
+          <label>Content</label>
+          <textarea id="edit-content">${escapeHtml(u.content || "")}</textarea>
+        </div>
+        <button onclick="saveUnitEdit('${u.id}')">Save Changes</button>
+        <button class="edit-cancel" onclick="openSidePanel('${u.id}')">Cancel</button>
+      </div>
+    </div>
+  `);
+
   body.innerHTML = sections.join("");
+}
+
+async function saveUnitEdit(unitId) {
+  const type = document.getElementById("edit-type").value;
+  const name = document.getElementById("edit-name").value || null;
+  const sectionStr = document.getElementById("edit-section").value;
+  const section = sectionStr ? sectionStr.split(",").map(s => s.trim()).filter(Boolean) : [];
+  const parentId = document.getElementById("edit-parent-id").value || null;
+  const content = document.getElementById("edit-content").value;
+
+  try {
+    const res = await fetch(`${API_URL}/debug/unit/${unitId}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", "Authorization": `Bearer ${apiKey}` },
+      body: JSON.stringify({ content, name, section, type, parentUnitId: parentId }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(`Error: ${data.error || res.status}`);
+      return;
+    }
+    // Reload the panel to show updated data
+    openSidePanel(unitId);
+  } catch (err) {
+    alert(`Error: ${err.message}`);
+  }
 }
 
 // ---- Context menu ----
@@ -1185,8 +1091,7 @@ function applyFilter() {
     return null;
   }
   const filtered = allRoots.map(filterTree).filter(Boolean);
-  if (diagramMode === "boxes") renderBoxes(filtered);
-  else renderTree(filtered);
+  renderBoxes(filtered);
   document.getElementById("status").textContent = `Showing ${filtered.length} root(s) (filtered)`;
 }
 </script>

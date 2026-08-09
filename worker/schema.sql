@@ -21,52 +21,27 @@ CREATE INDEX IF NOT EXISTS idx_structure_nodes_parent ON structure_nodes(parent_
 
 CREATE TABLE IF NOT EXISTS semantic_units (
   id TEXT PRIMARY KEY,
+  document_id TEXT,
   source_node_id TEXT NOT NULL,
-  type TEXT NOT NULL,          -- Rule, Attribute, Skill, Trait, Ability, Action, StatusEffect, Item, Spell, Example, Situation, Modifier, Definition, Equipment, Weapon, Formula, Table
+  type TEXT NOT NULL,          -- Rule, Table
   name TEXT,
   page INTEGER,
   section TEXT NOT NULL,       -- JSON array section path
   content TEXT NOT NULL,
   content_hash TEXT NOT NULL,
   summary TEXT,
-  metadata_json TEXT,          -- raw Phase 4 extraction output (defines/references/requires/exceptions/modifies/modified_by/keywords/aliases)
-  parent_unit_id TEXT,         -- primary parent (row tree: section/header)
-  secondary_parent_unit_id TEXT, -- secondary parent (column tree: column header)
+  metadata_json TEXT,          -- raw Phase 4 extraction output (defines/references/requires/exceptions/modifies/modified_by/overrides/related_to/incompatible_with/creates/consumes/supersedes/example_of/part_of/aliases)
+  parent_unit_id TEXT,         -- parent unit (section/header)
   source_order INTEGER NOT NULL DEFAULT 0, -- position of this unit within its source structure node (for adjacency relations)
   embedding_id TEXT,           -- Vectorize vector id
   status TEXT NOT NULL DEFAULT 'pending', -- pending -> summary_done -> metadata_done -> relations_done -> done
   updated_at TEXT NOT NULL,
-  FOREIGN KEY (parent_unit_id) REFERENCES semantic_units(id),
-  FOREIGN KEY (secondary_parent_unit_id) REFERENCES semantic_units(id)
+  FOREIGN KEY (parent_unit_id) REFERENCES semantic_units(id)
 );
 CREATE INDEX IF NOT EXISTS idx_semantic_units_source_node ON semantic_units(source_node_id);
 CREATE INDEX IF NOT EXISTS idx_semantic_units_status ON semantic_units(status);
 CREATE INDEX IF NOT EXISTS idx_semantic_units_hash ON semantic_units(content_hash);
-CREATE INDEX IF NOT EXISTS idx_semantic_units_secondary_parent ON semantic_units(secondary_parent_unit_id);
-
-CREATE TABLE IF NOT EXISTS concepts (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  description TEXT,
-  aliases TEXT -- JSON array
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_concepts_name ON concepts(name);
-
-CREATE TABLE IF NOT EXISTS concept_unit (
-  concept_id TEXT NOT NULL,
-  unit_id TEXT NOT NULL,
-  PRIMARY KEY (concept_id, unit_id),
-  FOREIGN KEY (concept_id) REFERENCES concepts(id),
-  FOREIGN KEY (unit_id) REFERENCES semantic_units(id)
-);
-
-CREATE TABLE IF NOT EXISTS keywords (
-  unit_id TEXT NOT NULL,
-  keyword TEXT NOT NULL,
-  PRIMARY KEY (unit_id, keyword),
-  FOREIGN KEY (unit_id) REFERENCES semantic_units(id)
-);
-CREATE INDEX IF NOT EXISTS idx_keywords_keyword ON keywords(keyword);
+CREATE INDEX IF NOT EXISTS idx_semantic_units_document ON semantic_units(document_id);
 
 CREATE TABLE IF NOT EXISTS relations (
   id TEXT PRIMARY KEY,
@@ -83,7 +58,7 @@ CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target_id);
 CREATE TABLE IF NOT EXISTS ingestion_jobs (
   id TEXT PRIMARY KEY,
   document_id TEXT NOT NULL,
-  phase TEXT NOT NULL,   -- units|summary|metadata|relations|done
+  phase TEXT NOT NULL,   -- vision|summary|metadata|relations|done
   status TEXT NOT NULL,  -- running|done|error
   detail TEXT,
   created_at TEXT NOT NULL,
@@ -122,3 +97,6 @@ CREATE TABLE IF NOT EXISTS debug_logs (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_debug_logs_created ON debug_logs(created_at);
+
+-- Drop deprecated unit_issues table (issue detection removed)
+DROP TABLE IF EXISTS unit_issues;

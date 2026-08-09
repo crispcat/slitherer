@@ -3,15 +3,25 @@ export interface Env {
   DB: D1Database;
   VECTORIZE_INDEX: VectorizeIndex;
   slitherer_rag_storage: R2Bucket;
+  VISION_QUEUE: Queue<QueueMessage>;
   EMBEDDING_MODEL: string;
   EMBEDDING_DIMENSIONS: string;
   EXTRACTION_MODEL: string;
+  REASONING_MODEL: string;
   ANSWER_MODEL: string;
   RERANK_MODEL: string;
+  VISION_MODEL: string;
   /** Required (via `wrangler secret put ADMIN_API_KEY`) to call any /ingest* endpoint. */
   ADMIN_API_KEY: string;
   /** Optional (via `wrangler secret put QUERY_API_KEY`). If set, /query also requires it. */
   QUERY_API_KEY?: string;
+}
+
+/** Message enqueued to the vision-ingest Queue for each page. */
+export interface QueueMessage {
+  jobId: string;
+  documentId: string;
+  pageNumber: number;
 }
 
 // ---- Phase 2 structural node, as produced by the local Python parser ----
@@ -25,38 +35,19 @@ export interface StructureNode {
   children: string[];
 }
 
-export interface StructureDocument {
-  root: string;
-  nodes: Record<string, StructureNode>;
-}
-
 // ---- Phase 3: semantic units ----
 export const SEMANTIC_UNIT_TYPES = [
   "Rule",
-  "Attribute",
-  "Skill",
-  "Trait",
-  "Ability",
-  "Action",
-  "StatusEffect",
-  "Item",
-  "Spell",
-  "Example",
-  "Situation",
-  "Modifier",
-  "Definition",
-  "Equipment",
-  "Weapon",
-  "Formula",
   "Table",
+  "Image",
 ] as const;
 export type SemanticUnitType = (typeof SEMANTIC_UNIT_TYPES)[number];
 
 export interface SemanticUnit {
   id: string;
+  documentId: string;
   sourceNodeId: string;
   parentUnitId: string | null;
-  secondaryParentUnitId: string | null;
   sourceOrder: number; // position within the source structure node (for adjacency relations)
   type: SemanticUnitType;
   name: string | null;
@@ -87,7 +78,6 @@ export interface UnitMetadata {
   supersedes: string[];
   example_of: string[];
   part_of: string[];
-  keywords: string[];
   aliases: string[];
 }
 
@@ -107,6 +97,8 @@ export const RELATION_TYPES = [
   "supersedes",
   "example_of",
   "part_of",
+  "parent_of",
+  "child_of",
 ] as const;
 export type RelationType = (typeof RELATION_TYPES)[number];
 
@@ -174,3 +166,35 @@ export interface IterationDebug {
   afterRerank: number;
   sufficiency?: SufficiencyResult;
 }
+
+// ---- Vision extraction pipeline ----
+
+/** A unit as returned by the vision model (before verification). */
+export interface VisionUnit {
+  id: string;
+  type: string;
+  name: string | null;
+  content: string;
+  /** Name of the parent unit, as output by the model. */
+  parentName: string | null;
+  /** Resolved from parentName in post-processing. The parent unit's id, or null for root. */
+  parentId: string | null;
+  page: number | null;
+  section: string[];
+}
+
+/** Continuation state passed between pages. */
+export interface VisionContinuation {
+  sectionPath: string[];
+  lastUnitName: string | null;
+  lastUnitContent: string;
+  /** Recent container units (name + content) for cross-page parent linking. */
+  lastContainers: { name: string; content: string }[];
+}
+
+/** Full response from the vision model for one page. */
+export interface VisionPageResult {
+  units: VisionUnit[];
+  continuation: VisionContinuation;
+}
+

@@ -23,8 +23,6 @@ function estimateTokens(text: string): number {
  *  - Chapter/section/type — structural context handled by parent/sibling
  *    expansion at retrieval time. Type is available as Vectorize metadata
  *    for future pre-filtering.
- *  - Keywords — already used for SQL candidate selection in Phase 5; redundant
- *    in the embedding.
  *  - Defines/references/requires/exceptions/modifies/modified_by — these are
  *    relationship descriptors that become typed graph edges in Phase 5.
  *    Including them here would double-count with graph expansion and dilute
@@ -69,9 +67,6 @@ export async function upsertEmbeddings(env: Env, units: SemanticUnit[], vectors:
       id: u.id,
       values: vectors.get(u.id)!,
       metadata: {
-        type: u.type,
-        section: u.section.join(" > "),
-        page: u.page,
         name: u.name ?? "",
       },
     }));

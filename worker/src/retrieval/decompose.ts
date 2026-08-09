@@ -36,7 +36,7 @@ export async function decompose(
       sub_queries: string[];
       rerank_threshold: number;
     }>(env, SYSTEM_PROMPT, userPrompt, {
-      model: env.ANSWER_MODEL,
+      model: env.REASONING_MODEL,
       schema: DECOMPOSE_SCHEMA,
     });
 

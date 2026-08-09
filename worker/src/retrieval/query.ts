@@ -1,6 +1,6 @@
 import type { Env, SemanticUnit } from "../types";
 import { embed, rerank } from "../utils/llm";
-import { getRelationsForUnits, getUnitsByIds, getChildrenOfUnit, getParentsOfUnit } from "../utils/db";
+import { getRelationsForUnits, getUnitsByIds, getChildrenOfUnit, getParentOfUnit } from "../utils/db";
 import { buildEnrichedDocument } from "../pipeline/embeddings";
 import { RETRIEVAL } from "../config.gen";
 
@@ -9,7 +9,7 @@ export interface RetrievedUnit {
   vectorScore?: number;
   rerankScore?: number;
   viaRelation?: string;
-  expansionRole?: "seed" | "row_parent" | "col_parent" | "row_sibling" | "col_sibling";
+  expansionRole?: "seed" | "parent" | "sibling" | "child";
   /** Which sub-query(ies) found this candidate. */
   sourceSubQueries?: number[];
 }
@@ -71,33 +71,31 @@ async function retrieveForSubQuery(
     if (existing) existing.unit = u;
   }
 
-  // 3b. Parent/sibling expansion
+  // 3b. Parent/sibling/child expansion
   const expandedIds = new Set<string>();
   for (const u of seedUnits) {
-    const { row, col } = await getParentsOfUnit(env, u);
-    if (row) {
-      if (!candidates.has(row.id) && !existingIds?.has(row.id)) expandedIds.add(row.id);
-      const rowSiblings = await getChildrenOfUnit(env, row.id);
-      for (const s of rowSiblings) {
+    // Fetch parent + siblings (other children of the same parent)
+    const parent = await getParentOfUnit(env, u);
+    if (parent) {
+      if (!candidates.has(parent.id) && !existingIds?.has(parent.id)) expandedIds.add(parent.id);
+      const siblings = await getChildrenOfUnit(env, parent.id);
+      for (const s of siblings) {
         if (s.id !== u.id && !candidates.has(s.id) && !existingIds?.has(s.id)) expandedIds.add(s.id);
       }
     }
-    if (col) {
-      if (!candidates.has(col.id) && !existingIds?.has(col.id)) expandedIds.add(col.id);
-      const colSiblings = await getChildrenOfUnit(env, col.id);
-      for (const s of colSiblings) {
-        if (s.id !== u.id && !candidates.has(s.id) && !existingIds?.has(s.id)) expandedIds.add(s.id);
-      }
+    // Fetch direct children of the seed unit
+    const children = await getChildrenOfUnit(env, u.id);
+    for (const c of children) {
+      if (!candidates.has(c.id) && !existingIds?.has(c.id)) expandedIds.add(c.id);
     }
   }
   if (expandedIds.size > 0) {
     const expandedUnits = await getUnitsByIds(env, [...expandedIds]);
     for (const u of expandedUnits) {
       if (!candidates.has(u.id)) {
-        let role: RetrievedUnit["expansionRole"] = "row_sibling";
-        if (seedUnits.some((s) => s.parentUnitId === u.id)) role = "row_parent";
-        else if (seedUnits.some((s) => s.secondaryParentUnitId === u.id)) role = "col_parent";
-        else if (seedUnits.some((s) => s.secondaryParentUnitId !== null && s.secondaryParentUnitId === u.secondaryParentUnitId)) role = "col_sibling";
+        let role: RetrievedUnit["expansionRole"] = "sibling";
+        if (seedUnits.some((s) => s.parentUnitId === u.id)) role = "parent";
+        else if (seedUnits.some((s) => s.id === u.parentUnitId)) role = "child";
         candidates.set(u.id, {
           unit: u,
           viaRelation: "parent_expansion",

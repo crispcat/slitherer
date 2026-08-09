@@ -1,10 +1,9 @@
 import type { Env, SemanticUnit } from "../types";
 import { llmJson } from "../utils/llm";
-import { getSemanticUnit } from "../utils/db";
+import { getSemanticUnit, getChildrenOfUnit } from "../utils/db";
 import { INGESTION } from "../config.gen";
 
-// Cap parent context so the prompt stays within the 70b model's budget.
-const PARENT_CONTEXT_MAX_CHARS = INGESTION.parentContext.maxChars.value;
+const CHILDREN_CONTENT_MAX_CHARS = INGESTION.parentContext.childrenMaxChars.value;
 const FALLBACK_SUMMARY_LEN = INGESTION.fallbackSummaryLength.value;
 
 const SUMMARY_SCHEMA: Record<string, unknown> = {
@@ -17,34 +16,36 @@ const SUMMARY_SCHEMA: Record<string, unknown> = {
 
 const SYSTEM_PROMPT = INGESTION.prompts.summary.text;
 
-/** Generate a concise summary for a semantic unit using the 70b model.
- *  Parent unit summaries (when available) are injected as context so child
- *  units — especially table cells and orphan-linked modifiers — get meaningful
- *  summaries that incorporate their parent's meaning. */
+/** Generate a concise summary for a semantic unit using the extraction model.
+ *  Context provided to the LLM:
+ *  - Parent unit name (not content/summary)
+ *  - The unit's own name + content (takes precedence)
+ *  - Children names (if aggregate content under threshold)
+ *  The LLM is explicitly instructed that the unit's own name and content
+ *  take precedence over parent/children context. */
 export async function generateSummary(env: Env, unit: SemanticUnit): Promise<string> {
-  let parentContext = "";
+  // Parent name only — no summary or content
+  let parentName = "";
   if (unit.parentUnitId) {
     const parent = await getSemanticUnit(env, unit.parentUnitId);
-    if (parent) {
-      const parentName = parent.name ?? "(unnamed)";
-      const parentText = (parent.summary ?? parent.content).slice(0, PARENT_CONTEXT_MAX_CHARS);
-      parentContext = `\nParent Unit (${parent.type}, ${parentName}):\n${parentText}`;
-    }
+    if (parent) parentName = parent.name ?? "";
   }
-  if (unit.secondaryParentUnitId) {
-    const colParent = await getSemanticUnit(env, unit.secondaryParentUnitId);
-    if (colParent) {
-      const colName = colParent.name ?? "(unnamed)";
-      const colText = (colParent.summary ?? colParent.content).slice(0, PARENT_CONTEXT_MAX_CHARS);
-      parentContext += `\nColumn Parent (${colParent.type}, ${colName}):\n${colText}`;
+
+  // Children names only (never content). Skip if aggregate content too large.
+  let childrenNames = "";
+  const children = await getChildrenOfUnit(env, unit.id);
+  if (children.length > 0) {
+    const totalChildrenContent = children.reduce((sum, c) => sum + c.content.length, 0);
+    if (totalChildrenContent <= CHILDREN_CONTENT_MAX_CHARS) {
+      childrenNames = children.map((c) => c.name ?? "(unnamed)").join(", ");
     }
   }
 
-  const userPrompt = `Type: ${unit.type}\nName: ${unit.name ?? "(unnamed)"}\nSection: ${unit.section.join(" > ")}${parentContext}\nContent:\n${unit.content}`;
+  const userPrompt = `Name: ${unit.name ?? "(unnamed)"}\nParent: ${parentName || "(none)"}\nChildren: ${childrenNames || "(none)"}\nContent:\n${unit.content}`;
 
   try {
     const result = await llmJson<{ summary: string }>(env, SYSTEM_PROMPT, userPrompt, {
-      model: env.ANSWER_MODEL,
+      model: env.EXTRACTION_MODEL,
       schema: SUMMARY_SCHEMA,
     });
     return result.summary ?? unit.content.slice(0, FALLBACK_SUMMARY_LEN);

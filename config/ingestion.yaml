@@ -11,20 +11,155 @@ models:
 
   extraction:
     binding: EXTRACTION_MODEL
-    default: "@cf/meta/llama-3.1-8b-instruct-fast"
+    default: "@cf/zai-org/glm-4.7-flash"
     description: >-
-      Used for Phase 3 orphan resolution (high-volume, low-stakes merge/link decisions)
+      Used for Phase 3 orphan resolution, Phase 4a summary generation, and
+      Phase 3 prev-rule linking. Multilingual (100+ langs), FC, 131K context,
+      latency-optimized. Good for low-complexity, high-volume, input-heavy tasks
+      requiring Russian understanding.
+
+  reasoning:
+    binding: REASONING_MODEL
+    default: "@cf/qwen/qwen3-30b-a3b-fp8"
+    description: >-
+      Used for Phase 3 table row refinement and Phase 4b metadata extraction.
+      30B MoE (3B active) with reasoning capability, excellent multilingual
+      (incl. Russian), very cheap input ($0.051/M). Best cost/quality for
+      medium-high complexity, high-volume extraction/reasoning tasks.
 
   answer:
     binding: ANSWER_MODEL
-    default: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    default: "@cf/openai/gpt-oss-120b"
     description: >-
-      Used for Phase 3 table row/column tree, summary generation, metadata extraction
+      Used for Phase 3 table column tree detection (highest-complexity ingestion
+      task — SPLIT/SIMPLE decision cascades to all table units). 120B with
+      reasoning, strong multilingual. Only ~62 calls per ingestion so absolute
+      cost is low despite being the strongest model.
 
   rerank:
     binding: RERANK_MODEL
     default: "@cf/baai/bge-reranker-base"
     description: Not used during ingestion (only retrieval)
+
+  vision:
+    binding: VISION_MODEL
+    default: "@cf/mistralai/mistral-small-3.1-24b-instruct"
+    description: >-
+      Vision-language model for visual-first extraction (Phase 3 replacement).
+      Reads page images and produces structured semantic units directly.
+      Mistral Small 3.1 24B: best vision model on Workers AI for this task.
+      Apache 2.0, 128K context, ~$0.0027/page.
+
+vision:
+  maxTokens:
+    value: 16000
+    description: >-
+      Maximum output tokens for vision extraction. 16K is enough for dense pages
+      with multiple tables. Increase if pages get truncated.
+    file: pipeline/vision_extract.ts
+
+  pagesPerCall:
+    value: 1
+    description: >-
+      Number of pages per API call. 1 = single page (default, simplest to debug).
+      Can be increased to 2 or 4 for fewer calls, but attention may degrade.
+    file: pipeline/vision_extract.ts
+
+  temperature:
+    value: 0
+    description: >-
+      Temperature for vision extraction. 0 for reproducibility — same page always
+      produces the same structure. The model does structural reasoning (table tree
+      decisions), but consistency is more valuable than creativity here.
+    file: pipeline/vision_extract.ts
+
+  continuationContainerCount:
+    value: 4
+    description: >-
+      Number of recent container units (units that had children) to pass to the
+      next page via VisionContinuation. Each entry includes the container's name
+      and content. Handles cross-page parent linking for tables spanning multiple
+      pages and parallel lists split across page breaks.
+    file: pipeline/vision_extract.ts
+
+  prompt:
+    description: System prompt for vision-based semantic unit extraction (Phase 3)
+    file: pipeline/vision_extract.ts
+    text: |-
+      You are a precise data extraction engine. You receive a page image from a tabletop RPG rulebook PDF. Your job is to extract the content into a structured JSON tree of "semantic units" — fine-grained, individually retrievable pieces of rules content.
+
+      You may receive continuation context from the previous page. Use it to:
+      - Continue the current section path if no new heading appears on this page.
+      - Complete a unit that was truncated at the bottom of the previous page.
+      - Link the first unit on this page to the correct parent from the previous page.
+
+      OUTPUT FORMAT — Return ONLY a JSON object:
+      {
+        "units": [
+          {
+            "type": "Rule",
+            "name": "Контроль",
+            "content": "...",
+            "parentName": null,
+            "section": ["II. КРАСНОЕ ЗОЛОТО", "2.1. Создание персонажа"]
+          }
+        ]
+      }
+
+      UNIT TYPES (3 types):
+      - "Rule" — any retrievable piece of rules content. This is the default for ALL content: abilities, spells, weapons, traits, actions, definitions, modifiers, examples, category labels, etc. A Rule has a name (the label/term) and content (the full text). A Rule can also serve as a container — if it has children but no content of its own, it's a category label grouping related items (e.g. "Основные:" with perks as children, or a "Disadvantages" column header with traits as children).
+      - "Table" — a container for tabular data where rows have a meaningful relationship across columns (e.g. a weapon table where each row has damage | type | requirements | weight). The table header is a "Table" unit, each row is a "Rule" child. Only use "Table" for actual data tables where columns describe properties of the same entity in each row.
+      - "Image" — a visual element that carries rules information (diagrams, charts, battlefield maps, illustrated tables). The "name" is a short label for the visual, and the "content" is a comprehensive text description of what the visual shows and how it relates to the rules. This text will be embedded for retrieval, so it must be detailed enough to answer questions about the visual. Do NOT create Image units for purely decorative elements (borders, logos, ornamental art).
+
+      GRANULARITY RULES:
+      1. Each unit should be ONE retrievable concept. A paragraph about one mechanic = one unit. A numbered perk = one unit. A table row = one unit. A bullet = one unit.
+      2. Split freely at any structural boundary: paragraphs, bullets, numbered items, bold labels, table rows, table cells, or any visual grouping. It is better to over-split than to merge unrelated content.
+      3. For data tables (type "Table"): each ROW is a separate "Rule" unit, child of the table header. If a table is a list of entities of the same type (e.g. Weapons, Spells), each entity is a "Rule" child of the "Table" header.
+      4. For independent column lists: if a layout has two or more columns that are unrelated lists (NOT a data table — row N on the left has no relationship to row N on the right, e.g. "Disadvantages" and "Advantages" side by side), extract each column as a separate "Rule" unit with the column label as "name", empty content, and the items in that column as children.
+      5. Numbered or bulleted items are each separate units, children of the introducing unit.
+      6. Bold-label definitions (e.g. "**Контроль (К)** — отражает ресурс...") get their own unit with the label as "name".
+      7. Do NOT create units for: page numbers, headers/footers, table of contents entries, decorative text.
+
+      NAMING RULES — critical for parent-child linking:
+      - Every unit MUST have a unique "name" within the page. If two units would have the same name, differentiate them (e.g. "КК – Шило" for the container and "КК – Шило: характеристики" for the stats, or append a suffix like "-2" for the second occurrence).
+      - The "name" is used by child units to reference this unit via "parentName". If names are not unique, parent linking will be ambiguous.
+      - A container unit (one that has children but no content of its own) should have a descriptive name (e.g. "Стержни", "Основные:", "Недостатки").
+
+      PARENT-CHILD HIERARCHY — the most important part:
+      - A section heading introduces a group of rules → those rules are children of the heading.
+      - A rule that introduces a list → list items are children of that rule.
+      - A definition → its modifiers/exceptions are children.
+      - A table → its rows are children.
+      - "parentName" is the "name" of the parent unit. Root units have parentName: null.
+      - The parent must be a unit that appears BEFORE this unit in the output (you cannot reference a unit you haven't output yet).
+      - IMPORTANT: parentName must NEVER be the unit's own name. If a unit has no parent, use null.
+      - If multiple units share the same name, parentName refers to the most recent one that appeared before this unit.
+
+      CONTENT PRESERVATION:
+      - Preserve the original text exactly, including formatting markers like **bold**, numbers, and punctuation.
+      - For table rows, format as markdown: | col1 | col2 |
+      - Include the full text of each unit — do not summarize or truncate.
+      - If text spans multiple lines, join them with spaces (unless it's a list item).
+
+      SECTION PATH:
+      - "section" is the full path of numbered headings from the start of the document down to the current section. It represents the book's structural organization, NOT the text's internal structure.
+      - It is an array of strings, starting with the top-level chapter heading, then each nested subsection heading: [chapter, section, subsection, ...]. Always include the COMPLETE path — never just the deepest heading.
+      - Example: a unit under "4.6. ДОМ СВЕТА" which is under "4. МАГИЯ" should have section: ["4. МАГИЯ", "4.6. ДОМ СВЕТА"], NOT just ["4.6. ДОМ СВЕТА"].
+      - Only include numbered headings that are part of the book's chapter/section hierarchy. Do NOT include table headers, sub-table labels, or content groupings as section paths — those are represented by parent-child relationships (parentName), not by section paths.
+      - You may not see all parent headings on the current page. Use the continuation context's sectionPath as the base, and replace/extend it with any new headings you see on this page. For example, if continuation says ["4. МАГИЯ"] and you see "4.6. ДОМ СВЕТА" on this page, the path is ["4. МАГИЯ", "4.6. ДОМ СВЕТА"].
+      - If no new numbered heading appears on this page, use the continuation context's sectionPath as-is.
+      - If you can't determine the section and no continuation context is available, use an empty array [].
+
+      PAGE NUMBER:
+      - The page number will be set by the calling system. You can omit it or set it to null.
+
+      CONTINUATION CONTEXT:
+      - If continuation context is provided, the "sectionPath", "lastUnitName", "lastUnitContent", and "lastContainers" from the previous page are given in the user message.
+      - lastUnitName / lastUnitContent: the last unit from the previous page. If this page starts with a continuation of that unit (e.g. a sentence cut off), merge it by setting parentName to lastUnitName.
+      - lastContainers: up to N recent container units (units that had children) from previous pages, each with their name and content. If this page starts with table rows, list items, or category entries that belong to a container from a previous page, set parentName to the matching container name from this list.
+      - Do NOT include a "continuation" field in your output. The system computes continuation state deterministically from your extracted units.
+
+      Return ONLY the JSON object with "units" and "images" arrays. No explanations, no markdown fences.
 
 embedding:
   maxTokens:
@@ -40,24 +175,14 @@ embedding:
 
 ingestion:
   batchSizes:
-    unitsDefault:
-      value: 3
-      description: Default batch size for Phase 3 unit detection (rules/notes)
-      file: pipeline/ingest.ts, index.ts
-
-    unitsClientDefault:
-      value: 5
-      description: Default batch size when client doesn't specify (used in ingest script)
-      file: index.ts
-
     summary:
       value: 2
-      description: Batch size cap for Phase 4a summary generation (70b calls are expensive)
+      description: Batch size cap for Phase 3a summary generation (LLM calls are expensive)
       file: pipeline/ingest.ts
 
     metadata:
       value: 2
-      description: Batch size cap for Phase 4b metadata extraction (70b calls are expensive)
+      description: Batch size cap for Phase 3b metadata extraction (LLM calls are expensive)
       file: pipeline/ingest.ts
 
     relations:
@@ -71,11 +196,6 @@ ingestion:
       description: Default batch size for /ingest/rebuild-relations endpoint
       file: pipeline/ingest.ts, index.ts
 
-  leafTypes:
-    value: [rule, table, note, image]
-    description: Structure node types that are processed as leaves in Phase 3
-    file: pipeline/ingest.ts
-
 parentContext:
   maxChars:
     value: 800
@@ -83,87 +203,32 @@ parentContext:
       Maximum characters of parent context included in summary and metadata prompts
     file: pipeline/summary.ts, pipeline/metadata.ts
 
+  childrenMaxChars:
+    value: 3000
+    description: >-
+      Aggregate children content length guard for summary prompts. Children
+      names (never content) are included only if the total children content
+      is under this threshold. If exceeded, children context is skipped
+      entirely to avoid flooding the prompt for large lists/tables.
+    file: pipeline/summary.ts
+
 fallbackSummaryLength:
   value: 240
   description: Character length of fallback summary (content slice) when LLM fails
   file: pipeline/summary.ts, pipeline/relationships.ts
 
-orphanResolution:
-  boldHeadingMaxLength:
-    value: 60
-    description: Maximum length for a bold heading to be considered an orphan candidate
-    file: pipeline/units.ts
-
-  contentMaxLength:
-    value: 60
-    description: Maximum content length for a unit to be considered an orphan candidate
-    file: pipeline/units.ts
-
-  maxRetries:
-    value: 1
-    description: Retry count for orphan resolution LLM calls
-    file: pipeline/units.ts
-
-tableProcessing:
-  visualCollapseFillRatio:
-    value: 0.7
-    description: >-
-      Fill ratio threshold for visual collapse guard — below this, table may be
-      reclassified as visual
-    file: pipeline/table_tree.ts
-
-  sparseGridFillRatio:
-    value: 0.6
-    description: Fill ratio threshold for sparse wide grid detection
-    file: pipeline/table_tree.ts
-
-  sparseGridColumnCount:
-    value: 10
-    description: Column count threshold for sparse wide grid detection
-    file: pipeline/table_tree.ts
-
-  visualReclassificationMaxDataRows:
-    value: 2
-    description: Allow visual reclassification if table has this many or fewer data rows
-    file: pipeline/table_tree.ts
-
-  rowRefinementMaxRetries:
-    value: 0
-    description: Retry count for row refinement LLM calls
-    file: pipeline/table_tree.ts
-
-  columnTreeMaxRetries:
-    value: 0
-    description: Retry count for column tree detection LLM calls
-    file: pipeline/table_tree.ts
-
-  prevRuleLinkingMaxRetries:
-    value: 0
-    description: Retry count for prev-rule linking LLM calls
-    file: pipeline/table_tree.ts
-
-  prevRuleContentMaxChars:
-    value: 800
-    description: Maximum characters of previous rule content sent to the linking LLM
-    file: pipeline/table_tree.ts
-
-  prevRuleTablePreviewRows:
-    value: 10
-    description: >-
-      Number of table rows (including header/separator) sent to the linking LLM.
-      Only the first N rows are needed to judge whether the table belongs to the
-      previous rule — the full table is not sent.
-    file: pipeline/table_tree.ts
-
 relationshipExtraction:
-  similarityThreshold:
-    value: 0.5
-    description: Minimum vector similarity for a relationship match to be kept
+  topKMatches:
+    value: 5
+    description: >-
+      Number of top matches to keep per term probe (replaces fixed threshold).
+      Since the correct target always ranks #1, top-K guarantees recall while
+      confidence = similarity score naturally deprioritizes weak edges.
     file: pipeline/relationships.ts
 
   vectorSearchTopK:
     value: 100
-    description: Vector search topK per term probe during relationship extraction
+    description: Vector search topK per term probe — how many results to retrieve from Vectorize before taking topKMatches
     file: pipeline/relationships.ts
 
   minTermLength:
@@ -189,16 +254,17 @@ llm:
 
 prompts:
   summary:
-    description: System prompt for Phase 4a summary generation (70b)
+    description: System prompt for Phase 3a summary generation (extraction model)
     file: pipeline/summary.ts
     text: |-
       You are a rules-analysis engine for a tabletop RPG rulebook (Russian language).
-      Given a single semantic unit, generate a short concise summary of what the unit says.
+      Given a semantic unit with its name, content, parent name, and children names,
+      generate a short concise summary of what the unit says.
 
-      If a "Parent Unit" is provided, use it as context: the current unit is a child,
-      modifier, or sub-rule of that parent. Incorporate the parent's meaning into the
-      summary where relevant, so the summary is self-contained and meaningful even when
-      read without the parent.
+      The unit's OWN name and content take PRECEDENCE over the parent and children
+      context. The summary should primarily describe what this unit itself says.
+      Use the parent name and children names only as framing context — to understand
+      where this unit sits in the hierarchy — not as the subject of the summary.
 
       Respond with ONLY a JSON object of the form:
       {"summary": "one to three sentence plain-language summary of this unit"}
@@ -206,18 +272,15 @@ prompts:
       Keep the original language (Russian) for the summary.
 
   metadata:
-    description: System prompt for Phase 4b metadata extraction (70b)
+    description: System prompt for Phase 3b metadata extraction (reasoning model)
     file: pipeline/metadata.ts
     text: |-
       You are a rules-analysis engine for a tabletop RPG rulebook (Russian language).
-      Given a single semantic unit and its pre-generated summary, extract structured metadata about it.
-
-      If a "Parent Unit" is provided, use it as context: the current unit is a child,
-      modifier, or sub-rule of that parent. Extract metadata that is explicitly present
-      in the current unit's own text or clearly implied by the parent-child relationship.
+      Given a single semantic unit (name, summary, content), extract structured metadata about it.
 
       Extract all relationship fields. Each field is a list of named mechanics, terms, or
-      units that the current unit relates to in the specified way:
+      units that the current unit relates to in the specified way. Only extract relationships
+      that are explicitly present in the unit's own text or clearly implied by its content.
       - defines: terms/mechanics this unit defines
       - references: named mechanics/sections this unit mentions or points to
       - requires: prerequisites for this unit to apply
@@ -234,7 +297,6 @@ prompts:
       - part_of: larger structures/categories this unit belongs to
 
       Also extract:
-      - keywords: salient keywords for search
       - aliases: alternate names/synonyms for this unit, if any
 
       Respond with ONLY a JSON object with the fields above. All arrays contain strings.
@@ -315,41 +377,11 @@ prompts:
          decorative formatting, diagrams). If the table has multiple data rows with
          meaningful content, do NOT use "visual".
 
-      PSEUDO-HEADER DETECTION (critical, apply FIRST before any other analysis):
-      In Markdown, the row before the --- separator is ALWAYS classified as "header"
-      by the deterministic skeleton. However, many tables have NO real header — the
-      first row is just the first data row, and the --- is merely a Markdown formatting
-      requirement. A pseudo-header is a pre-separator row that:
-      - Has the same number of columns as the data rows after the separator
-      - Contains the same TYPE of content as the data rows (not column names/labels)
-      - Does not stand out as a title or category label
-
-      MANDATORY CHECK: Compare the pre-separator row to the post-separator data rows.
-      If the pre-separator row has the SAME number of columns AND contains the same
-      kind of content (e.g. values, names, numbers — not column labels like "Name",
-      "Value", "Description"), you MUST reclassify it as "data":
-      {"row": <idx>, "new_role": "data"}
-
-      Key-value lookup tables (no column headers, just paired values):
-        [0]| Value 1 | Weak | Value 4 | Exceptional |    ← classified as "header", but it's DATA
-        [1]| --- | --- | --- | --- |                      ← separator
-        [2]| Value 2 | Average | Value 5 | Extraordinary |← data
-        [3]| Value 3 | Noticeable | Value 6 | Incredible |← data
-      Correction: [{"row": 0, "new_role": "data"}]
-
-      Another example (Russian, same pattern):
-        [0]| Значение 1 | Слабый | Значение 4 | Выдающийся |  ← classified as "header", but it's DATA
-        [1]| --- | --- | --- | --- |                            ← separator
-        [2]| Значение 2 | Средний | Значение 5 | Исключительный |← data
-        [3]| Значение 3 | Заметный | Значение 6 | Невероятный |  ← data
-      Correction: [{"row": 0, "new_role": "data"}]
-
-      If you find a pseudo-header, return the correction IMMEDIATELY. Do NOT return []
-      when a pseudo-header is present.
-
       Rules:
       - Do NOT drop any rows. Every row must remain in the tree.
       - Do NOT create multiple roots. Only the first node can have parent: null.
+      - Do NOT reclassify the root node (the first row). Its type is determined
+        deterministically before this step.
       - "new_parent" must reference a row that appears BEFORE the current row in the table.
       - If the classification is correct, return: []
 
@@ -376,62 +408,63 @@ prompts:
       Each node: {"id","type","cols":[...],"parent":id or null}
       Data nodes should have "parent" pointing to the column header node they belong to.
 
-      KEY DECISION: Are columns PROPERTIES of one entity, or INDEPENDENT sub-tables?
+      STEP 1 — Answer this question first (put it in "reason"):
+        Look at the HEADER row. Do the column headers label DIFFERENT categories
+        (e.g. "Disadvantages" vs "Advantages", "Cost" vs "Effect")? If so, the
+        columns are independent lists → SPLIT, regardless of whether individual
+        data cells look related.
 
-      SPLIT (independent sub-tables side by side) — each column or column-group is a
-      separate list. Data in one column is NOT a property of the other column.
-        - Disadvantages | Advantages (two unrelated lists)
-        - Weapon A stats | Weapon B stats (two separate weapons)
-        - Cost | Effect | Cost | Effect (two separate price lists)
-        - Key | Value | Key | Value (two key-value pair groups side by side)
-        - Merged title row + independent item lists in each column
-          (e.g. "Perks" | "Perks" title, then col 0 = items 1-6, col 1 = items 7-12)
-        - Spell names in col 0 | Spell names in col 1 (two independent spell lists,
-          data rows alternate between names and descriptions)
-      → Create one "data" node per column-group, each with "parent" pointing to its header.
-        Keep key-value pairs TOGETHER in one data node (e.g. cols:[0,1] not cols:[0] and cols:[1]).
-        A merged title row (all cells identical) does NOT mean columns are related —
-        check the DATA rows to decide if columns are independent.
+        If the headers are not clearly different categories, look at the DATA rows.
+        Pick any data row. Does col 0's value DESCRIBE or BELONG TO the same thing
+        as col 1's value in that row? Or are they two unrelated items from
+        different lists that just happen to be on the same line?
 
-      SIMPLE (properties of one entity) — columns describe attributes of the same row.
-        - Attr | Value | Cost (one item per row, columns are its properties)
-        - Name | Description | Price (one entity per row)
-        - Key | Value (one key-value pair per row, both columns describe the same entity)
-        - Level | Property1 | Property2 | Property3 (one level per row, all columns
-          describe that level's attributes)
-      → Create ONE "data" node with ALL columns, parent=null.
+        - If col 0 and col 1 in the same row are RELATED (one is a property of
+          the other, or both describe the same entity) → SIMPLE.
+        - If col 0 and col 1 in the same row are UNRELATED (they're from two
+          different lists placed side by side) → SPLIT.
 
-      HOW TO DECIDE: Look at the DATA rows, not just the header.
-        - If col 0 contains sequential keys (0, 1, 2, ...) and other columns describe
-          properties of each key → SIMPLE (all columns describe the same entity).
-        - If each column contains its own independent list of items (names, descriptions,
-          or values that don't reference each other) → SPLIT.
-        - If data rows alternate between short names and long descriptions in each column
-          independently → SPLIT (each column is its own name→description list).
+        Example: Header "| Disadvantages | Advantages |" → two different categories
+        → SPLIT. Even if a data row has "| Ugliness | Beauty |" (opposites), they
+        belong to different lists.
+
+        Example: Header "| Name | Price |" → "Price" is a property of "Name"
+        → SIMPLE. "Sword" and "50" are related (50 is the sword's price).
+
+      STEP 2 — Build the column tree:
+        SPLIT → one "data" node per column, each with its own header.
+        SIMPLE → one "data" node with ALL columns, parent=null.
+        Keep key-value pairs TOGETHER in one data node (cols:[0,1] not [0] and [1]).
 
       EXAMPLE — SPLIT (2 columns, independent lists):
       [0]|Disadvantages|Advantages|
-      column_tree: [{"id":0,"type":"header","cols":[0],"parent":null},{"id":1,"type":"header","cols":[1],"parent":null},{"id":2,"type":"data","cols":[0],"parent":0},{"id":3,"type":"data","cols":[1],"parent":1}]
+      [2]|Bad cooking|Good cooking|
+      [3]|No music|Plays instruments|
+      Reason: "Bad cooking" and "Good cooking" in row [2] are unrelated — one is
+      a disadvantage, the other an advantage. Two independent lists.
+      → {"column_tree":[{"id":0,"type":"header","cols":[0],"parent":null},{"id":1,"type":"header","cols":[1],"parent":null},{"id":2,"type":"data","cols":[0],"parent":0},{"id":3,"type":"data","cols":[1],"parent":1}]}
 
       EXAMPLE — SPLIT (2 columns, merged title + independent numbered lists):
       [0]|Perks|Perks|
       [2]|1) Item A|7) Item G|
       [3]|2) Item B|8) Item H|
-      column_tree: [{"id":0,"type":"header","cols":[0],"parent":null},{"id":1,"type":"header","cols":[1],"parent":null},{"id":2,"type":"data","cols":[0],"parent":0},{"id":3,"type":"data","cols":[1],"parent":1}]
-      Note: The merged title row "Perks|Perks" is just a section label. The data rows
-      have INDEPENDENT numbered lists (1-6 in col 0, 7-12 in col 1) → SPLIT, not SIMPLE.
+      Reason: The merged title is a section label. Items 1-6 and 7-12 are two
+      independent numbered lists placed side by side.
+      → {"column_tree":[{"id":0,"type":"header","cols":[0],"parent":null},{"id":1,"type":"header","cols":[1],"parent":null},{"id":2,"type":"data","cols":[0],"parent":0},{"id":3,"type":"data","cols":[1],"parent":1}]}
+
+      EXAMPLE — SIMPLE (one entity per row):
+      [0]|Name|Price|
+      [2]|Sword|50|
+      [3]|Shield|30|
+      Reason: "Sword" and "50" in row [2] are related — 50 is the sword's price.
+      → {"column_tree":[{"id":0,"type":"data","cols":[0,1],"parent":null}]}
 
       EXAMPLE — SPLIT (4 columns, key-value pairs side by side):
       [0]|Key1|Value1|Key2|Value2|
-      column_tree: [{"id":0,"type":"header","cols":[0,1],"parent":null},{"id":1,"type":"header","cols":[2,3],"parent":null},{"id":2,"type":"data","cols":[0,1],"parent":0},{"id":3,"type":"data","cols":[2,3],"parent":1}]
-
-      EXAMPLE — SPLIT (4 columns, paired):
-      [0]|WeaponA|WeaponA|WeaponB|WeaponB|
-      column_tree: [{"id":0,"type":"header","cols":[0],"parent":null},{"id":1,"type":"header","cols":[1],"parent":null},{"id":2,"type":"header","cols":[2],"parent":null},{"id":3,"type":"header","cols":[3],"parent":null},{"id":4,"type":"data","cols":[0,1],"parent":0},{"id":5,"type":"data","cols":[2,3],"parent":2}]
-
-      EXAMPLE — SIMPLE (multi-property):
-      [0]|Attr|Value|Cost|
-      column_tree: [{"id":0,"type":"data","cols":[0,1,2],"parent":null}]
+      [2]|A|X|B|Y|
+      Reason: Cols [0,1] form one key-value pair (A:X), cols [2,3] form another
+      (B:Y). Two independent pairs side by side.
+      → {"column_tree":[{"id":0,"type":"header","cols":[0,1],"parent":null},{"id":1,"type":"header","cols":[2,3],"parent":null},{"id":2,"type":"data","cols":[0,1],"parent":0},{"id":3,"type":"data","cols":[2,3],"parent":1}]}
 
       Return ONLY JSON: {"column_tree":[...],"reason":"..."}
 
@@ -457,14 +490,19 @@ prompts:
       Respond with ONLY a JSON object: {"link": true, "reason": "..."} or {"link": false, "reason": "..."}
 
       Link to the previous rule (link: true) if ALL of these are true:
-      - The table has no clear header, title, or description row (no merged description,
-        no column names that label the table as a standalone entity)
-      - The table is a simple key-value lookup, reference, or data table
+      - The table is a reference, lookup, or data table that elaborates the previous rule
       - The table's content is directly related to the previous rule's topic (e.g. the
-        rule describes attributes and the table lists attribute value meanings)
+        rule describes attributes and the table lists attribute value meanings, or the
+        rule describes a skill and the table lists its perks)
+      - The table does not describe a standalone entity that could be understood without
+        the previous rule's context
+
+      A merged title row (all cells identical, e.g. "Perks | Perks") is just a section
+      label — it does NOT make the table independent. If the title refers to the same
+      topic as the previous rule, the table should be linked.
 
       Do NOT link (link: false) if ANY of these are true:
-      - The table has its own header, title, merged description, or section label
-      - The table is an independent entity (a separate list of items, spells, weapons, etc.)
+      - The table is an independent entity with its own distinct header columns (e.g. a
+        weapon table with "Name | Damage | Price" headers that stands alone)
       - The table's content is unrelated to the previous rule
       - The previous rule is too short or generic to be a meaningful parent

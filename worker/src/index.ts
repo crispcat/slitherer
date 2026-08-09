@@ -1,6 +1,6 @@
-import type { Env, StructureDocument, ConversationMessage } from "./types";
-import { processIngestionBatch, rebuildAllRelationships, startIngestion, INGEST_STAGES } from "./pipeline/ingest";
-import { cleanupDocument, getIngestionJob, getLastConversationTurns, logQueryStep, logDebug, resetIngestionStage, getAllUnits, getSourceNodesWithUnits, getUnitDetails, getDebugLogs, clearDebugLogs } from "./utils/db";
+import type { Env, ConversationMessage, QueueMessage } from "./types";
+import { processIngestionBatch, processVisionPage, rebuildAllRelationships, startIngestion, INGEST_STAGES } from "./pipeline/ingest";
+import { cleanupDocument, getIngestionJob, getLastConversationTurns, logQueryStep, logDebug, resetIngestionStage, getAllUnits, getSourceNodesWithUnits, getUnitDetails, getDebugLogs, clearDebugLogs, updateUnit } from "./utils/db";
 import { runQuery, runQueryStream } from "./retrieval/pipeline";
 import { route, generateChatResponse } from "./retrieval/router";
 import { decompose } from "./retrieval/decompose";
@@ -67,21 +67,6 @@ function isQueryAuthorized(request: Request, env: Env): boolean {
   return token.length > 0 && safeEqual(token, env.QUERY_API_KEY);
 }
 
-/**
- * Structure documents are large; the client is expected to store the raw
- * structure.json in R2 first (or POST it directly for small docs) and pass
- * either { structure: StructureDocument } or { bucketKey: string }.
- */
-async function loadStructureDoc(env: Env, body: any): Promise<StructureDocument> {
-  if (body.structure) return body.structure as StructureDocument;
-  if (body.bucketKey) {
-    const obj = await env.slitherer_rag_storage.get(body.bucketKey);
-    if (!obj) throw new Error(`No such object in BUCKET: ${body.bucketKey}`);
-    return (await obj.json()) as StructureDocument;
-  }
-  throw new Error("Request body must include either 'structure' or 'bucketKey'");
-}
-
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -106,64 +91,52 @@ export default {
         return json({ ok: true });
       }
 
-      // POST /ingest/upload?documentId=...&sourcePath=...
-      // Body: raw StructureDocument JSON. Stores it (plus a small sourcePath
-      // sidecar) in R2 and returns { bucketKey } for use with POST /ingest.
-      // This is the recommended default path — it sidesteps any client/edge
-      // request-body-size caveats around inlining `structure` directly.
-      if (url.pathname === "/ingest/upload" && request.method === "POST") {
-        const documentId = url.searchParams.get("documentId");
-        const sourcePath = url.searchParams.get("sourcePath") ?? "unknown";
-        if (!documentId) return json({ error: "documentId query param is required" }, 400);
-
-        const bodyText = await request.text();
-        JSON.parse(bodyText); // validate it's well-formed JSON before storing
-
-        const bucketKey = `structures/${documentId}.json`;
-        await env.slitherer_rag_storage.put(bucketKey, bodyText, {
-          httpMetadata: { contentType: "application/json" },
-        });
-        await env.slitherer_rag_storage.put(
-          `structures/${documentId}.meta.json`,
-          JSON.stringify({ documentId, sourcePath, uploadedAt: new Date().toISOString() })
-        );
-
-        return json({ bucketKey, documentId, sourcePath });
-      }
-
-      // POST /ingest  { documentId, sourcePath, structure | bucketKey }
-      // Starts (or restarts) ingestion for a document and stores the structure
-      // tree + a resumable job. Returns { jobId }.
+      // POST /ingest  { documentId, sourcePath, totalPages, pages? }
+      // Starts (or restarts) ingestion for a document. The client is expected
+      // to have already uploaded page images to R2 (pages/{documentId}/*.png).
+      // This endpoint creates a job and enqueues pages to the vision Queue.
+      // If `pages` is provided (array of 1-indexed page numbers), only those
+      // pages are enqueued; otherwise all pages 1..totalPages are enqueued.
       if (url.pathname === "/ingest" && request.method === "POST") {
         const body = await request.json<any>();
         const documentId: string = body.documentId ?? uuid();
         const sourcePath: string = body.sourcePath ?? "unknown";
-        const doc = await loadStructureDoc(env, body);
+        const totalPages: number = body.totalPages;
+        if (!totalPages || totalPages < 1) {
+          return json({ error: "totalPages is required (must be >= 1)" }, 400);
+        }
+        const pages: number[] | null = Array.isArray(body.pages) ? body.pages : null;
         const jobId = uuid();
 
-        await env.slitherer_rag_storage.put(`jobs/${jobId}.json`, JSON.stringify(doc));
+        const { totalPages: tp } = await startIngestion(env, documentId, sourcePath, totalPages, jobId, pages);
 
-        const { totalNodes } = await startIngestion(env, documentId, sourcePath, doc, jobId);
-        return json({ jobId, documentId, totalNodes });
+        // Enqueue pages to the vision Queue (FIFO order, max_concurrency=1)
+        const pagesToEnqueue = pages ?? Array.from({ length: totalPages }, (_, i) => i + 1);
+        const messages: { body: QueueMessage }[] = [];
+        for (const page of pagesToEnqueue) {
+          messages.push({ body: { jobId, documentId, pageNumber: page } });
+        }
+        await env.VISION_QUEUE.sendBatch(messages);
+
+        await logDebug(env, "info", "ingestion", `Enqueued ${pagesToEnqueue.length} pages to vision queue`, { jobId, documentId, pages: pagesToEnqueue });
+        return json({ jobId, documentId, totalPages: tp, pagesEnqueued: pagesToEnqueue.length });
       }
 
       // POST /ingest/step { jobId, batchSize?, stage? }
-      // Advances an ingestion job by one batch. Call repeatedly until done=true.
-      // If stage is specified (e.g. "units", "summary", "metadata", "relations"),
+      // Advances an ingestion job by one batch for the summary/metadata/relations phases.
+      // The vision phase is Queue-driven — call this to advance post-vision phases.
+      // If stage is specified (e.g. "summary", "metadata", "relations"),
       // skips ahead to that phase and stops after it completes.
       if (url.pathname === "/ingest/step" && request.method === "POST") {
         const body = await request.json<any>();
         const jobId: string = body.jobId;
-        const obj = await env.slitherer_rag_storage.get(`jobs/${jobId}.json`);
-        if (!obj) return json({ error: "job structure not found" }, 404);
-        const doc = (await obj.json()) as StructureDocument;
         const stage = body.stage;
         if (stage && !INGEST_STAGES.includes(stage)) {
           return json({ error: `Invalid stage: ${stage}. Valid stages: ${INGEST_STAGES.join(", ")}` }, 400);
         }
         const result = await processIngestionBatch(
-          env, doc, jobId,
-          body.batchSize ?? INGESTION.ingestion.batchSizes.unitsDefault.value,
+          env, jobId,
+          body.batchSize ?? INGESTION.ingestion.batchSizes.summary.value,
           stage
         );
         return json(result);
@@ -175,6 +148,39 @@ export default {
         const job = await getIngestionJob(env, jobId);
         if (!job) return json({ error: "not found" }, 404);
         return json(job);
+      }
+
+      // PUT /ingest/r2/{key} — upload binary data to R2 at the specified key.
+      // Used by the ingest script to upload page images to R2.
+      // The key path is everything after /ingest/r2/ in the URL.
+      // Optional header `X-Content-Hash` stores a hash in customMetadata for
+      // skip-if-unchanged checks on subsequent uploads.
+      {
+        const r2Match = url.pathname.match(/^\/ingest\/r2\/(.+)$/);
+        if (r2Match && request.method === "PUT") {
+          const r2Key = r2Match[1];
+          const contentType = request.headers.get("content-type") ?? "application/octet-stream";
+          const contentHash = request.headers.get("x-content-hash") ?? undefined;
+          const body = await request.arrayBuffer();
+          await env.slitherer_rag_storage.put(r2Key, body, {
+            httpMetadata: { contentType },
+            customMetadata: contentHash ? { hash: contentHash } : undefined,
+          });
+          return json({ ok: true, key: r2Key, size: body.byteLength });
+        }
+      }
+
+      // GET /ingest/r2/meta/{key} — check if an R2 object exists and return its metadata.
+      // Used by the ingest script to skip re-uploading unchanged files (hash check).
+      // Returns { exists, hash, size } where hash is the customMetadata hash.
+      {
+        const metaMatch = url.pathname.match(/^\/ingest\/r2\/meta\/(.+)$/);
+        if (metaMatch && request.method === "GET") {
+          const r2Key = metaMatch[1];
+          const obj = await env.slitherer_rag_storage.head(r2Key);
+          if (!obj) return json({ exists: false });
+          return json({ exists: true, hash: obj.customMetadata?.hash ?? null, size: obj.size });
+        }
       }
 
       // POST /ingest/cleanup { documentId }
@@ -190,7 +196,8 @@ export default {
       // POST /ingest/reset-stage { documentId, stage }
       // Clears the outputs of the specified stage AND all downstream stages,
       // then resets unit statuses so the stage can be re-run from clean state.
-      // Stages: units | summary | metadata | relations
+      // Stages: vision | summary | metadata | relations
+      // For "vision": also re-enqueues all pages to the vision Queue.
       if (url.pathname === "/ingest/reset-stage" && request.method === "POST") {
         const body = await request.json<any>();
         const documentId: string = body.documentId;
@@ -200,39 +207,87 @@ export default {
           return json({ error: `Invalid stage: ${stage}. Valid stages: ${INGEST_STAGES.join(", ")}` }, 400);
         }
         await resetIngestionStage(env, documentId, stage);
+
+        // For vision reset: re-enqueue pages to the vision Queue
+        if (stage === "vision") {
+          const job = await getIngestionJob(env, body.jobId);
+          if (!job) {
+            return json({ error: "jobId not found. Provide jobId to re-enqueue vision pages." }, 400);
+          }
+          const jobId = job.id as string;
+          const detail = JSON.parse(job.detail as string);
+          const totalPages = detail.totalPages;
+          if (!totalPages || totalPages < 1) {
+            return json({ error: "totalPages not found in job detail" }, 400);
+          }
+          const pagesToEnqueue = Array.isArray(detail.pages) ? detail.pages : Array.from({ length: totalPages }, (_, i) => i + 1);
+          const messages: { body: QueueMessage }[] = [];
+          for (const page of pagesToEnqueue) {
+            messages.push({ body: { jobId, documentId, pageNumber: page } });
+          }
+          await env.VISION_QUEUE.sendBatch(messages);
+          await logDebug(env, "info", "ingestion:vision", `Re-enqueued ${pagesToEnqueue.length} pages after vision reset`, { jobId, documentId, pages: pagesToEnqueue });
+          return json({ ok: true, documentId, stage, reEnqueued: pagesToEnqueue.length, jobId });
+        }
+
         return json({ ok: true, documentId, stage });
       }
 
-      // POST /ingest/table { node }
-      // Processes a single table node and returns the detected semantic units
-      // WITHOUT saving to DB. Useful for testing table processing in isolation.
-      if (url.pathname === "/ingest/table" && request.method === "POST") {
+      // POST /ingest/vision/test { image: base64, page: number, continuation?, writeToDb?, documentId? }
+      // Test endpoint: extracts units from a single page image and optionally
+      // writes them to D1 for debugging via the debug frontend.
+      // Returns { units, continuation, logs? }
+      if (url.pathname === "/ingest/vision/test" && request.method === "POST") {
         const body = await request.json<any>();
-        const node = body.node;
-        if (!node || node.type !== "table") {
-          return json({ error: "node (type=table) is required" }, 400);
+        if (!body.image) return json({ error: "image (base64 string) is required" }, 400);
+        const pageNumber: number = body.page ?? 0;
+        const documentId: string = body.documentId ?? "test-doc";
+        const writeToDb: boolean = body.writeToDb === true;
+
+        const { extractPage } = await import("./pipeline/vision_extract");
+        const { normalizeUnits } = await import("./pipeline/vision_verify");
+        const { upsertSemanticUnit } = await import("./utils/db");
+        const { sha256 } = await import("./utils/hash");
+
+        const result = await extractPage(
+          env,
+          body.image,
+          pageNumber,
+          body.continuation ?? null,
+          body.model,
+          body.maxTokens,
+        );
+
+        const normalized = normalizeUnits(result.units);
+
+        if (writeToDb) {
+          const now = new Date().toISOString();
+          for (let i = 0; i < normalized.length; i++) {
+            const unit = normalized[i];
+            const contentHash = await sha256(unit.content);
+            await upsertSemanticUnit(env, {
+              id: unit.id,
+              documentId,
+              sourceNodeId: `page-${pageNumber}`,
+              parentUnitId: unit.parentId,
+              sourceOrder: i,
+              type: unit.type as any,
+              name: unit.name,
+              page: pageNumber,
+              section: unit.section,
+              content: unit.content,
+              contentHash,
+              status: "pending",
+              updatedAt: now,
+            });
+          }
         }
-        // Process the table and return both the structure and units for debugging.
-        const { detectTableStructure, buildTableUnitsFromTree } = await import("./pipeline/table_tree");
-        const structure = await detectTableStructure(env, node);
-        const detectedUnits = buildTableUnitsFromTree(node, structure);
-        // Convert DetectedUnit[] to SemanticUnit[] (assign IDs).
-        const units = detectedUnits.map((u, i) => ({
-          id: `UNIT-${i}`,
-          type: u.type,
-          sourceOrder: i,
-          parentUnitId: u.parentIndex !== undefined ? `UNIT-${u.parentIndex}` : undefined,
-          secondaryParentUnitId: u.secondaryParentIndex !== undefined ? `UNIT-${u.secondaryParentIndex}` : undefined,
-          content: u.content,
-        }));
+
         return json({
-          nodeId: node.id,
-          unitCount: units.length,
-          structure: {
-            row_tree: structure.row_tree,
-            column_tree: structure.column_tree,
-          },
-          units,
+          page: pageNumber,
+          units: normalized,
+          continuation: result.continuation,
+          writtenToDb: writeToDb,
         });
       }
 
@@ -244,6 +299,7 @@ export default {
         const result = await rebuildAllRelationships(env, body.batchSize ?? INGESTION.ingestion.batchSizes.rebuildRelations.value, body.cursor ?? 0);
         return json(result);
       }
+
 
       // POST /query { question, conversationId?, stream?, debug?, graphHops?, maxIterations? }
       // Full agentic retrieval pipeline: router → decompose → retrieve → sufficiency loop → answer.
@@ -499,7 +555,7 @@ export default {
 
       // GET /debug/tree?format=tree|flat&sourceNodeId=<id>
       // Returns the semantic unit hierarchy for visualization.
-      // - format=flat (default): array of {id, parentId, secondaryParentId, type, name, section, status}
+      // - format=flat (default): array of {id, parentId, type, name, section, status}
       // - format=tree: nested tree rooted at units with no parent
       // - sourceNodeId: filter to units from a specific structure node (table/rule)
       if (url.pathname === "/debug/tree" && request.method === "GET") {
@@ -512,7 +568,6 @@ export default {
         const flat = units.map((u) => ({
           id: u.id,
           parentId: u.parentUnitId ?? null,
-          secondaryParentId: u.secondaryParentUnitId ?? null,
           type: u.type,
           name: u.name ?? "",
           content: u.content ?? "",
@@ -525,7 +580,8 @@ export default {
           const byId = new Map(flat.map((u) => [u.id, { ...u, children: [] as any[] }]));
           const roots: any[] = [];
           for (const u of byId.values()) {
-            if (u.parentId && byId.has(u.parentId)) {
+            // Guard against self-parenting (cycles break tree layout)
+            if (u.parentId && u.parentId !== u.id && byId.has(u.parentId)) {
               byId.get(u.parentId)!.children.push(u);
             } else {
               roots.push(u);
@@ -538,7 +594,7 @@ export default {
 
       // GET /debug/unit/:id
       // Returns comprehensive data for a single unit: all fields, metadata,
-      // keywords, concepts, relations (outgoing + incoming), parent/child units,
+      // relations (outgoing + incoming), parent/child units,
       // and the source structure node. Used by the tree viewer side panel.
       {
         const unitMatch = url.pathname.match(/^\/debug\/unit\/(.+)$/);
@@ -546,6 +602,24 @@ export default {
           const details = await getUnitDetails(env, unitMatch[1]);
           if (!details) return json({ error: "unit not found" }, 404);
           return json(details);
+        }
+      }
+
+      // PUT /debug/unit/:id
+      // Updates editable fields of a semantic unit (content, name, section, type, parentId).
+      // Used by the debug frontend to correct vision extraction errors.
+      {
+        const unitMatch = url.pathname.match(/^\/debug\/unit\/(.+)$/);
+        if (unitMatch && request.method === "PUT") {
+          const body = await request.json<any>();
+          await updateUnit(env, unitMatch[1], {
+            content: body.content,
+            name: body.name,
+            section: body.section,
+            type: body.type,
+            parentUnitId: body.parentUnitId,
+          });
+          return json({ ok: true, unitId: unitMatch[1] });
         }
       }
 
@@ -573,6 +647,32 @@ export default {
       console.error(err?.stack ?? err); // full detail in `wrangler tail`, not in the response
       try { await logDebug(env, "error", "worker", err?.message ?? "internal error", { stack: err?.stack }); } catch {}
       return json({ error: err?.message ?? "internal error" }, 500);
+    }
+  },
+
+  // Queue handler — processes vision pages from the VISION_QUEUE.
+  // With max_concurrency=1, pages are processed sequentially in FIFO order,
+  // ensuring continuation state is consistent between pages.
+  async queue(batch: MessageBatch<QueueMessage>, env: Env): Promise<void> {
+    for (const message of batch.messages) {
+      const { jobId, documentId, pageNumber } = message.body;
+      try {
+        await processVisionPage(env, jobId, documentId, pageNumber);
+        message.ack();
+      } catch (err: any) {
+        console.error(`[queue] page ${pageNumber} failed: ${err?.message}`);
+        try {
+          await logDebug(env, "error", "ingestion:vision", `Queue page ${pageNumber} failed`, {
+            jobId,
+            documentId,
+            pageNumber,
+            error: err?.message,
+            stack: err?.stack,
+          });
+        } catch {}
+        // Retry: the message will be redelivered up to max_retries times
+        message.retry();
+      }
     }
   },
 };

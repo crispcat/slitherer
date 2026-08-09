@@ -28,9 +28,10 @@ export async function upsertStructureNode(env: Env, documentId: string, node: St
 export async function upsertSemanticUnit(env: Env, u: SemanticUnit) {
   await env.DB.prepare(
     `INSERT INTO semantic_units
-       (id, source_node_id, type, name, page, section, content, content_hash, summary, metadata_json, parent_unit_id, secondary_parent_unit_id, source_order, embedding_id, status, updated_at)
+       (id, document_id, source_node_id, type, name, page, section, content, content_hash, summary, metadata_json, parent_unit_id, source_order, embedding_id, status, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
+       document_id = excluded.document_id,
        source_node_id = excluded.source_node_id,
        type = excluded.type,
        name = excluded.name,
@@ -41,7 +42,6 @@ export async function upsertSemanticUnit(env: Env, u: SemanticUnit) {
        summary = excluded.summary,
        metadata_json = excluded.metadata_json,
        parent_unit_id = excluded.parent_unit_id,
-       secondary_parent_unit_id = excluded.secondary_parent_unit_id,
        source_order = excluded.source_order,
        embedding_id = excluded.embedding_id,
        status = excluded.status,
@@ -49,6 +49,7 @@ export async function upsertSemanticUnit(env: Env, u: SemanticUnit) {
   )
     .bind(
       u.id,
+      u.documentId ?? null,
       u.sourceNodeId,
       u.type,
       u.name,
@@ -59,7 +60,6 @@ export async function upsertSemanticUnit(env: Env, u: SemanticUnit) {
       u.summary ?? null,
       u.metadata ? JSON.stringify(u.metadata) : null,
       u.parentUnitId ?? null,
-      u.secondaryParentUnitId ?? null,
       u.sourceOrder ?? null,
       u.embeddingId ?? null,
       u.status,
@@ -102,9 +102,9 @@ export async function getUnitsByIds(env: Env, ids: string[]): Promise<SemanticUn
 function rowToUnit(row: any): SemanticUnit {
   return {
     id: row.id,
+    documentId: row.document_id ?? undefined,
     sourceNodeId: row.source_node_id,
     parentUnitId: row.parent_unit_id,
-    secondaryParentUnitId: row.secondary_parent_unit_id ?? null,
     sourceOrder: row.source_order ?? 0,
     type: row.type,
     name: row.name,
@@ -123,56 +123,27 @@ function rowToUnit(row: any): SemanticUnit {
 /** Fetch all children of a unit (by primary or secondary parent). */
 export async function getChildrenOfUnit(env: Env, parentId: string): Promise<SemanticUnit[]> {
   const { results } = await env.DB.prepare(
-    `SELECT * FROM semantic_units WHERE parent_unit_id = ? OR secondary_parent_unit_id = ?`
+    `SELECT * FROM semantic_units WHERE parent_unit_id = ?`
   )
-    .bind(parentId, parentId)
+    .bind(parentId)
     .all();
   return (results ?? []).map(rowToUnit);
 }
 
-/** Fetch both parents of a unit (row parent + column parent). */
-export async function getParentsOfUnit(
+/** Fetch the parent of a unit. */
+export async function getParentOfUnit(
   env: Env,
   unit: SemanticUnit
-): Promise<{ row: SemanticUnit | null; col: SemanticUnit | null }> {
-  const ids = [unit.parentUnitId, unit.secondaryParentUnitId].filter((x): x is string => x !== null);
-  if (ids.length === 0) return { row: null, col: null };
-  const units = await getUnitsByIds(env, ids);
-  const row = unit.parentUnitId ? units.find((u) => u.id === unit.parentUnitId) ?? null : null;
-  const col = unit.secondaryParentUnitId ? units.find((u) => u.id === unit.secondaryParentUnitId) ?? null : null;
-  return { row, col };
-}
-
-export async function upsertConcept(env: Env, id: string, name: string, description: string, aliases: string[]) {
-  await env.DB.prepare(
-    `INSERT INTO concepts (id, name, description, aliases) VALUES (?, ?, ?, ?)
-     ON CONFLICT(name) DO UPDATE SET description = excluded.description, aliases = excluded.aliases`
-  )
-    .bind(id, name, description, JSON.stringify(aliases))
-    .run();
-}
-
-export async function getConceptIdByName(env: Env, name: string): Promise<string | null> {
-  const row = await env.DB.prepare(`SELECT id FROM concepts WHERE name = ?`).bind(name).first<{ id: string }>();
-  return row?.id ?? null;
-}
-
-export async function linkConceptUnit(env: Env, conceptId: string, unitId: string) {
-  await env.DB.prepare(`INSERT OR IGNORE INTO concept_unit (concept_id, unit_id) VALUES (?, ?)`)
-    .bind(conceptId, unitId)
-    .run();
-}
-
-export async function insertKeyword(env: Env, unitId: string, keyword: string) {
-  await env.DB.prepare(`INSERT OR IGNORE INTO keywords (unit_id, keyword) VALUES (?, ?)`).bind(unitId, keyword).run();
-}
-
-export async function clearKeywords(env: Env, unitId: string) {
-  await env.DB.prepare(`DELETE FROM keywords WHERE unit_id = ?`).bind(unitId).run();
+): Promise<SemanticUnit | null> {
+  if (!unit.parentUnitId) return null;
+  return getSemanticUnit(env, unit.parentUnitId);
 }
 
 export async function clearRelationsForSource(env: Env, unitId: string) {
-  await env.DB.prepare(`DELETE FROM relations WHERE source_id = ?`).bind(unitId).run();
+  // Clear LLM-extracted relations but keep deterministic parent_of/child_of
+  await env.DB.prepare(
+    `DELETE FROM relations WHERE source_id = ? AND relation_type NOT IN ('parent_of', 'child_of')`
+  ).bind(unitId).run();
 }
 
 export async function insertRelation(env: Env, r: Relation) {
@@ -207,33 +178,27 @@ export async function getAllUnits(env: Env): Promise<SemanticUnit[]> {
 }
 
 /** Fetch comprehensive data for a single unit: the unit itself, its metadata,
- *  keywords, concepts, relations (outgoing + incoming), and parent/child units.
+ *  relations (outgoing + incoming), and parent/child units.
  *  Used by the debug tree viewer side panel. */
 export async function getUnitDetails(env: Env, unitId: string) {
   const unit = await env.DB.prepare(`SELECT * FROM semantic_units WHERE id = ?`).bind(unitId).first();
   if (!unit) return null;
 
-  const [keywords, concepts, relationsOut, relationsIn, parentUnit, secondaryParent, children, sourceNode] = await Promise.all([
-    env.DB.prepare(`SELECT keyword FROM keywords WHERE unit_id = ?`).bind(unitId).all(),
-    env.DB.prepare(`SELECT c.id, c.name, c.description, c.aliases FROM concepts c JOIN concept_unit cu ON cu.concept_id = c.id WHERE cu.unit_id = ?`).bind(unitId).all(),
+  const [relationsOut, relationsIn, parentUnit, children, sourceNode] = await Promise.all([
     env.DB.prepare(`SELECT id, target_id, relation_type, confidence FROM relations WHERE source_id = ?`).bind(unitId).all(),
     env.DB.prepare(`SELECT id, source_id, relation_type, confidence FROM relations WHERE target_id = ?`).bind(unitId).all(),
     unit.parent_unit_id ? env.DB.prepare(`SELECT id, name, type FROM semantic_units WHERE id = ?`).bind(unit.parent_unit_id).first() : Promise.resolve(null),
-    unit.secondary_parent_unit_id ? env.DB.prepare(`SELECT id, name, type FROM semantic_units WHERE id = ?`).bind(unit.secondary_parent_unit_id).first() : Promise.resolve(null),
-    env.DB.prepare(`SELECT id, name, type FROM semantic_units WHERE parent_unit_id = ? OR secondary_parent_unit_id = ?`).bind(unitId, unitId).all(),
+    env.DB.prepare(`SELECT id, name, type FROM semantic_units WHERE parent_unit_id = ?`).bind(unitId).all(),
     env.DB.prepare(`SELECT id, type, section_path, page FROM structure_nodes WHERE id = ?`).bind(unit.source_node_id).first(),
   ]);
 
   return {
     unit: rowToUnit(unit as any),
-    keywords: (keywords.results ?? []).map((r: any) => r.keyword),
-    concepts: (concepts.results ?? []).map((r: any) => ({ id: r.id, name: r.name, description: r.description, aliases: r.aliases })),
     relations: {
       outgoing: (relationsOut.results ?? []).map((r: any) => ({ id: r.id, target: r.target_id, type: r.relation_type, confidence: r.confidence })),
       incoming: (relationsIn.results ?? []).map((r: any) => ({ id: r.id, source: r.source_id, type: r.relation_type, confidence: r.confidence })),
     },
     parent: parentUnit as any,
-    secondaryParent: secondaryParent as any,
     children: (children.results ?? []).map((r: any) => ({ id: r.id, name: r.name, type: r.type })),
     sourceNode: sourceNode as any,
   };
@@ -280,12 +245,9 @@ export async function getUnitsByStatusParentFirst(env: Env, status: string, limi
        AND (parent_unit_id IS NULL OR parent_unit_id IN (
          SELECT id FROM semantic_units WHERE status != ?
        ))
-       AND (secondary_parent_unit_id IS NULL OR secondary_parent_unit_id IN (
-         SELECT id FROM semantic_units WHERE status != ?
-       ))
      LIMIT ?`
   )
-    .bind(status, status, status, limit)
+    .bind(status, status, limit)
     .all();
 
   if ((results ?? []).length > 0) {
@@ -328,17 +290,19 @@ export async function getIngestionJob(env: Env, id: string) {
 
 /** Delete all data for a document across D1, Vectorize, and R2. */
 export async function cleanupDocument(env: Env, documentId: string) {
+  // Get unit IDs directly via document_id column (no join needed)
   const { results } = await env.DB.prepare(
-    `SELECT su.id FROM semantic_units su
-     JOIN structure_nodes sn ON su.source_node_id = sn.id
-     WHERE sn.document_id = ?`
+    `SELECT id FROM semantic_units WHERE document_id = ?`
   )
     .bind(documentId)
     .all();
   const unitIds = ((results ?? []) as any[]).map((r: any) => r.id as string);
 
-  for (let i = 0; i < unitIds.length; i += 100) {
-    const chunk = unitIds.slice(i, i + 100);
+  // Vectorize IDs must be <= 64 bytes. Filter out any oversized IDs
+  // (from older ingestion runs) to avoid rejecting the entire batch.
+  const validIds = unitIds.filter((id) => id.length <= 64);
+  for (let i = 0; i < validIds.length; i += 100) {
+    const chunk = validIds.slice(i, i + 100);
     await env.VECTORIZE_INDEX.deleteByIds(chunk);
   }
 
@@ -348,40 +312,18 @@ export async function cleanupDocument(env: Env, documentId: string) {
   const jobIds = ((jobRows.results ?? []) as any[]).map((r: any) => r.id as string);
 
   await env.DB.batch([
-    env.DB.prepare(
-      `DELETE FROM keywords WHERE unit_id IN (
-        SELECT su.id FROM semantic_units su
-        JOIN structure_nodes sn ON su.source_node_id = sn.id
-        WHERE sn.document_id = ?
-       )`
-    ).bind(documentId),
-    env.DB.prepare(
-      `DELETE FROM relations WHERE source_id IN (
-        SELECT su.id FROM semantic_units su
-        JOIN structure_nodes sn ON su.source_node_id = sn.id
-        WHERE sn.document_id = ?
-       )`
-    ).bind(documentId),
-    env.DB.prepare(
-      `DELETE FROM relations WHERE target_id IN (
-        SELECT su.id FROM semantic_units su
-        JOIN structure_nodes sn ON su.source_node_id = sn.id
-        WHERE sn.document_id = ?
-       )`
-    ).bind(documentId),
-    env.DB.prepare(
-      `DELETE FROM concept_unit WHERE unit_id IN (
-        SELECT su.id FROM semantic_units su
-        JOIN structure_nodes sn ON su.source_node_id = sn.id
-        WHERE sn.document_id = ?
-       )`
-    ).bind(documentId),
-    env.DB.prepare(`DELETE FROM semantic_units WHERE source_node_id IN (SELECT id FROM structure_nodes WHERE document_id = ?)`).bind(documentId),
+    env.DB.prepare(`DELETE FROM relations WHERE source_id IN (SELECT id FROM semantic_units WHERE document_id = ?)`).bind(documentId),
+    env.DB.prepare(`DELETE FROM relations WHERE target_id IN (SELECT id FROM semantic_units WHERE document_id = ?)`).bind(documentId),
+    env.DB.prepare(`DELETE FROM semantic_units WHERE document_id = ?`).bind(documentId),
     env.DB.prepare(`DELETE FROM structure_nodes WHERE document_id = ?`).bind(documentId),
     env.DB.prepare(`DELETE FROM ingestion_jobs WHERE document_id = ?`).bind(documentId),
     env.DB.prepare(`DELETE FROM documents WHERE id = ?`).bind(documentId),
   ]);
 
+  // Delete R2 objects: structures, jobs.
+  // Preserve: page images (pages/{documentId}/) — these are expensive to
+  // re-render/upload and the ingest script skips re-uploading unchanged files
+  // via hash check. Re-rendering is only needed if the source PDF changes.
   await env.slitherer_rag_storage.delete(`structures/${documentId}.json`);
   await env.slitherer_rag_storage.delete(`structures/${documentId}.meta.json`).catch(() => {});
   for (const jobId of jobIds) {
@@ -394,10 +336,11 @@ export async function cleanupDocument(env: Env, documentId: string) {
  * Clears the outputs of the specified stage AND all downstream stages,
  * then resets unit statuses so the stage can be re-run.
  *
- * Stage hierarchy: units → summary → metadata → relations
- * - "units":    clears everything (semantic_units, embeddings, relations, concepts, keywords)
- * - "summary":  clears summaries, embeddings, metadata, relations, concepts, keywords; resets status to "pending"
- * - "metadata": clears metadata, relations, concepts, keywords; resets status to "summary_done"
+ * Stage hierarchy: vision → summary → metadata → relations
+ * - "vision":   clears everything (semantic_units, embeddings, relations); resets job to vision phase
+ * - "units":    same as "vision" (legacy alias)
+ * - "summary":  clears summaries, embeddings, metadata, relations; resets status to "pending"
+ * - "metadata": clears metadata, relations; resets status to "summary_done"
  * - "relations": clears relations only; resets status to "metadata_done"
  *
  * Structure nodes, documents, and R2 structure files are preserved (no re-upload needed).
@@ -405,13 +348,46 @@ export async function cleanupDocument(env: Env, documentId: string) {
 export async function resetIngestionStage(env: Env, documentId: string, stage: string) {
   // Get all unit IDs for this document (needed for Vectorize deletion)
   const { results } = await env.DB.prepare(
-    `SELECT su.id FROM semantic_units su
-     JOIN structure_nodes sn ON su.source_node_id = sn.id
-     WHERE sn.document_id = ?`
+    `SELECT id FROM semantic_units WHERE document_id = ?`
   )
     .bind(documentId)
     .all();
-  const unitIds = ((results ?? []) as any[]).map((r: any) => r.id as string);
+  const unitIds = ((results ?? []) as any[])
+    .map((r: any) => r.id as string)
+    .filter((id: string) => id.length <= 64); // Vectorize max ID is 64 bytes
+
+  if (stage === "vision") {
+    // Reset the vision phase: delete all extracted units + downstream data,
+    // then reset the job so pages can be re-enqueued to the vision Queue.
+    // Keeps: documents, R2 page images, and the job row.
+    for (let i = 0; i < unitIds.length; i += 100) {
+      const chunk = unitIds.slice(i, i + 100);
+      await env.VECTORIZE_INDEX.deleteByIds(chunk);
+    }
+
+    await env.DB.batch([
+      env.DB.prepare(`DELETE FROM relations WHERE source_id IN (SELECT id FROM semantic_units WHERE document_id = ?)`).bind(documentId),
+      env.DB.prepare(`DELETE FROM relations WHERE target_id IN (SELECT id FROM semantic_units WHERE document_id = ?)`).bind(documentId),
+      env.DB.prepare(`DELETE FROM semantic_units WHERE document_id = ?`).bind(documentId),
+    ]);
+
+    // Reset job detail: phase back to "vision", pagesProcessed=0, continuation=null
+    const jobs = await env.DB.prepare(`SELECT id, detail FROM ingestion_jobs WHERE document_id = ?`)
+      .bind(documentId)
+      .all();
+    for (const job of (jobs.results ?? []) as any[]) {
+      let detail: any;
+      try { detail = JSON.parse(job.detail); } catch { detail = {}; }
+      detail.phase = "vision";
+      detail.pagesProcessed = 0;
+      detail.unitsProcessed = 0;
+      detail.continuation = null;
+      await env.DB.prepare(`UPDATE ingestion_jobs SET phase = ?, status = ?, detail = ?, updated_at = ? WHERE id = ?`)
+        .bind("vision", "running", JSON.stringify(detail), new Date().toISOString(), job.id)
+        .run();
+    }
+    return;
+  }
 
   if (stage === "units") {
     // Full reset: delete everything except structure_nodes, documents, and R2 files
@@ -422,35 +398,9 @@ export async function resetIngestionStage(env: Env, documentId: string, stage: s
     }
 
     await env.DB.batch([
-      env.DB.prepare(
-        `DELETE FROM keywords WHERE unit_id IN (
-          SELECT su.id FROM semantic_units su
-          JOIN structure_nodes sn ON su.source_node_id = sn.id
-          WHERE sn.document_id = ?
-         )`
-      ).bind(documentId),
-      env.DB.prepare(
-        `DELETE FROM relations WHERE source_id IN (
-          SELECT su.id FROM semantic_units su
-          JOIN structure_nodes sn ON su.source_node_id = sn.id
-          WHERE sn.document_id = ?
-         )`
-      ).bind(documentId),
-      env.DB.prepare(
-        `DELETE FROM relations WHERE target_id IN (
-          SELECT su.id FROM semantic_units su
-          JOIN structure_nodes sn ON su.source_node_id = sn.id
-          WHERE sn.document_id = ?
-         )`
-      ).bind(documentId),
-      env.DB.prepare(
-        `DELETE FROM concept_unit WHERE unit_id IN (
-          SELECT su.id FROM semantic_units su
-          JOIN structure_nodes sn ON su.source_node_id = sn.id
-          WHERE sn.document_id = ?
-         )`
-      ).bind(documentId),
-      env.DB.prepare(`DELETE FROM semantic_units WHERE source_node_id IN (SELECT id FROM structure_nodes WHERE document_id = ?)`).bind(documentId),
+      env.DB.prepare(`DELETE FROM relations WHERE source_id IN (SELECT id FROM semantic_units WHERE document_id = ?)`).bind(documentId),
+      env.DB.prepare(`DELETE FROM relations WHERE target_id IN (SELECT id FROM semantic_units WHERE document_id = ?)`).bind(documentId),
+      env.DB.prepare(`DELETE FROM semantic_units WHERE document_id = ?`).bind(documentId),
       env.DB.prepare(`DELETE FROM ingestion_jobs WHERE document_id = ?`).bind(documentId),
     ]);
     return;
@@ -467,34 +417,8 @@ export async function resetIngestionStage(env: Env, documentId: string, stage: s
     }
 
     batchStmts.push(
-      env.DB.prepare(
-        `DELETE FROM keywords WHERE unit_id IN (
-          SELECT su.id FROM semantic_units su
-          JOIN structure_nodes sn ON su.source_node_id = sn.id
-          WHERE sn.document_id = ?
-         )`
-      ).bind(documentId),
-      env.DB.prepare(
-        `DELETE FROM relations WHERE source_id IN (
-          SELECT su.id FROM semantic_units su
-          JOIN structure_nodes sn ON su.source_node_id = sn.id
-          WHERE sn.document_id = ?
-         )`
-      ).bind(documentId),
-      env.DB.prepare(
-        `DELETE FROM relations WHERE target_id IN (
-          SELECT su.id FROM semantic_units su
-          JOIN structure_nodes sn ON su.source_node_id = sn.id
-          WHERE sn.document_id = ?
-         )`
-      ).bind(documentId),
-      env.DB.prepare(
-        `DELETE FROM concept_unit WHERE unit_id IN (
-          SELECT su.id FROM semantic_units su
-          JOIN structure_nodes sn ON su.source_node_id = sn.id
-          WHERE sn.document_id = ?
-         )`
-      ).bind(documentId),
+      env.DB.prepare(`DELETE FROM relations WHERE source_id IN (SELECT id FROM semantic_units WHERE document_id = ?)`).bind(documentId),
+      env.DB.prepare(`DELETE FROM relations WHERE target_id IN (SELECT id FROM semantic_units WHERE document_id = ?)`).bind(documentId),
       // Reset all units to "pending" status, clear summary + metadata + embedding_id
       env.DB.prepare(
         `UPDATE semantic_units SET
@@ -503,71 +427,33 @@ export async function resetIngestionStage(env: Env, documentId: string, stage: s
           embedding_id = NULL,
           status = 'pending',
           updated_at = ?
-         WHERE source_node_id IN (SELECT id FROM structure_nodes WHERE document_id = ?)`
+         WHERE document_id = ?`
       ).bind(new Date().toISOString(), documentId),
     );
   } else if (stage === "metadata") {
     batchStmts.push(
-      env.DB.prepare(
-        `DELETE FROM keywords WHERE unit_id IN (
-          SELECT su.id FROM semantic_units su
-          JOIN structure_nodes sn ON su.source_node_id = sn.id
-          WHERE sn.document_id = ?
-         )`
-      ).bind(documentId),
-      env.DB.prepare(
-        `DELETE FROM relations WHERE source_id IN (
-          SELECT su.id FROM semantic_units su
-          JOIN structure_nodes sn ON su.source_node_id = sn.id
-          WHERE sn.document_id = ?
-         )`
-      ).bind(documentId),
-      env.DB.prepare(
-        `DELETE FROM relations WHERE target_id IN (
-          SELECT su.id FROM semantic_units su
-          JOIN structure_nodes sn ON su.source_node_id = sn.id
-          WHERE sn.document_id = ?
-         )`
-      ).bind(documentId),
-      env.DB.prepare(
-        `DELETE FROM concept_unit WHERE unit_id IN (
-          SELECT su.id FROM semantic_units su
-          JOIN structure_nodes sn ON su.source_node_id = sn.id
-          WHERE sn.document_id = ?
-         )`
-      ).bind(documentId),
+      env.DB.prepare(`DELETE FROM relations WHERE source_id IN (SELECT id FROM semantic_units WHERE document_id = ?)`).bind(documentId),
+      env.DB.prepare(`DELETE FROM relations WHERE target_id IN (SELECT id FROM semantic_units WHERE document_id = ?)`).bind(documentId),
       // Reset units that are at metadata_done or later back to summary_done, clear metadata
       env.DB.prepare(
         `UPDATE semantic_units SET
           metadata_json = NULL,
           status = 'summary_done',
           updated_at = ?
-         WHERE source_node_id IN (SELECT id FROM structure_nodes WHERE document_id = ?)
+         WHERE document_id = ?
          AND status IN ('metadata_done', 'relations_done', 'done')`
       ).bind(new Date().toISOString(), documentId),
     );
   } else if (stage === "relations") {
     batchStmts.push(
-      env.DB.prepare(
-        `DELETE FROM relations WHERE source_id IN (
-          SELECT su.id FROM semantic_units su
-          JOIN structure_nodes sn ON su.source_node_id = sn.id
-          WHERE sn.document_id = ?
-         )`
-      ).bind(documentId),
-      env.DB.prepare(
-        `DELETE FROM relations WHERE target_id IN (
-          SELECT su.id FROM semantic_units su
-          JOIN structure_nodes sn ON su.source_node_id = sn.id
-          WHERE sn.document_id = ?
-         )`
-      ).bind(documentId),
+      env.DB.prepare(`DELETE FROM relations WHERE source_id IN (SELECT id FROM semantic_units WHERE document_id = ?)`).bind(documentId),
+      env.DB.prepare(`DELETE FROM relations WHERE target_id IN (SELECT id FROM semantic_units WHERE document_id = ?)`).bind(documentId),
       // Reset units that are at relations_done or done back to metadata_done
       env.DB.prepare(
         `UPDATE semantic_units SET
           status = 'metadata_done',
           updated_at = ?
-         WHERE source_node_id IN (SELECT id FROM structure_nodes WHERE document_id = ?)
+         WHERE document_id = ?
          AND status IN ('relations_done', 'done')`
       ).bind(new Date().toISOString(), documentId),
     );
@@ -677,4 +563,38 @@ export async function getDebugLogs(env: Env, since?: string, limit = 200): Promi
 
 export async function clearDebugLogs(env: Env) {
   await env.DB.prepare(`DELETE FROM debug_logs`).run();
+}
+
+/** Update a single semantic unit's editable fields (content, name, section, type, parentId). */
+export async function updateUnit(
+  env: Env,
+  unitId: string,
+  fields: { content?: string; name?: string | null; section?: string[]; type?: string; parentUnitId?: string | null }
+) {
+  const sets: string[] = ["updated_at = ?"];
+  const binds: any[] = [new Date().toISOString()];
+  if (fields.content !== undefined) {
+    sets.push("content = ?");
+    binds.push(fields.content);
+  }
+  if (fields.name !== undefined) {
+    sets.push("name = ?");
+    binds.push(fields.name);
+  }
+  if (fields.section !== undefined) {
+    sets.push("section = ?");
+    binds.push(JSON.stringify(fields.section));
+  }
+  if (fields.type !== undefined) {
+    sets.push("type = ?");
+    binds.push(fields.type);
+  }
+  if (fields.parentUnitId !== undefined) {
+    sets.push("parent_unit_id = ?");
+    binds.push(fields.parentUnitId);
+  }
+  binds.push(unitId);
+  await env.DB.prepare(`UPDATE semantic_units SET ${sets.join(", ")} WHERE id = ?`)
+    .bind(...binds)
+    .run();
 }

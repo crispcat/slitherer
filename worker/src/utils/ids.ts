@@ -3,7 +3,7 @@
 // counter, but Cloudflare Workers isolates are ephemeral (a fresh isolate is
 // used for every request, and definitely after a CPU-limit-exceeded crash),
 // so the counter reset on every retry and produced duplicate IDs for
-// different rows, causing PRIMARY KEY collisions in D1 (e.g. concepts.id).
+// different rows, causing PRIMARY KEY collisions in D1 (e.g. relations.id).
 export function nextId(prefix: string): string {
   const key = prefix.toUpperCase();
   return `${key}-${crypto.randomUUID()}`;

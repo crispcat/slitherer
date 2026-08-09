@@ -5,29 +5,38 @@
 models:
   router:
     binding: EXTRACTION_MODEL
-    default: "@cf/meta/llama-3.1-8b-instruct-fast"
+    default: "@cf/zai-org/glm-4.7-flash"
     description: >-
       Used for Step 1 router (RAG/chat classification + language detection +
-      translation) and chat responses
+      translation) and chat responses. Multilingual (100+ langs), FC,
+      latency-optimized — best for translation quality and fast response.
     file: retrieval/router.ts
 
   decompose:
-    binding: ANSWER_MODEL
-    default: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    binding: REASONING_MODEL
+    default: "@cf/qwen/qwen3-30b-a3b-fp8"
     description: >-
-      Used for Step 2 query decomposition into sub-queries + dynamic rerank threshold
+      Used for Step 2 query decomposition into sub-queries + dynamic rerank threshold.
+      30B MoE (3B active) with reasoning — fast (latency-critical), understands
+      query intent, excellent Russian.
     file: retrieval/decompose.ts
 
   sufficiency:
-    binding: ANSWER_MODEL
-    default: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
-    description: Used for Step 5 sufficiency check + follow-up query generation
+    binding: REASONING_MODEL
+    default: "@cf/qwen/qwen3-30b-a3b-fp8"
+    description: >-
+      Used for Step 5 sufficiency check + follow-up query generation. Extremely
+      input-heavy (20-50:1 I/O ratio) — qwen3's cheap input ($0.051/M) is the
+      decisive factor. Reasoning capability handles coverage/interaction evaluation.
     file: retrieval/sufficiency.ts
 
   answer:
     binding: ANSWER_MODEL
-    default: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
-    description: Used for Step 6 answer generation with citations
+    default: "@cf/openai/gpt-oss-120b"
+    description: >-
+      Used for Step 6 answer generation with citations. User-facing output —
+      uses the strongest model (120B reasoning). Output is 3x cheaper than 70b,
+      strong multilingual for answer generation in user's language.
     file: retrieval/answer.ts
 
   embedding:

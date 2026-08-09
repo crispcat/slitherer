@@ -43,7 +43,30 @@ cd pages && npm run deploy:all
 cd worker && npm run db:migrate:remote
 ```
 
-Schema is idempotent (`CREATE TABLE IF NOT EXISTS`), safe to re-run.
+Schema is idempotent (`CREATE TABLE IF NOT EXISTS`), safe to re-run for new tables.
+
+**Note:** `CREATE TABLE IF NOT EXISTS` does NOT add columns to existing tables.
+If the schema has been updated with new columns on an existing table, you need
+to either `ALTER TABLE` the specific column or drop and recreate the table:
+
+```bash
+# Drop specific table and re-apply schema (destructive — loses that table's data)
+npx wrangler d1 execute slitherer-rag-db --remote --command "DROP TABLE IF EXISTS semantic_units;"
+npm run db:migrate:remote
+
+# Or drop all tables and start fresh
+npx wrangler d1 execute slitherer-rag-db --remote --command "DROP TABLE IF EXISTS relations; DROP TABLE IF EXISTS semantic_units; DROP TABLE IF EXISTS structure_nodes; DROP TABLE IF EXISTS ingestion_jobs; DROP TABLE IF EXISTS documents; DROP TABLE IF EXISTS query_logs; DROP TABLE IF EXISTS conversations; DROP TABLE IF EXISTS debug_logs;"
+npm run db:migrate:remote
+```
+
+### Create the vision Queue
+
+The vision pipeline uses a Cloudflare Queue (`vision-ingest`) for page-by-page
+processing. Create it once:
+
+```bash
+cd worker && npx wrangler queues create vision-ingest
+```
 
 ### Clear all ingestion data
 
@@ -55,105 +78,84 @@ cd worker && npm run clear
 
 This removes:
 - Local: `.ingest-state.json`, `ingest.log`
-- Remote: D1 tables (semantic_units, structure_nodes, relations, keywords, concepts, ingestion_jobs, documents), Vectorize vectors, R2 objects
+- Remote: D1 tables (semantic_units, structure_nodes, relations, ingestion_jobs, documents), Vectorize vectors, R2 job/structure files
 
-It does NOT clear client logs (conversations, query_logs) and does NOT parse
-the document or redeploy the worker.
+It does NOT clear R2 page images (these are reused on the next ingest — the
+ingest script skips re-uploading unchanged files via hash check). It does NOT
+clear client logs (conversations, query_logs) and does NOT redeploy the worker.
 
-### Re-ingest after parser changes
+### Re-ingest after source PDF changes
 
-1. Re-run the parser (both stages):
-   ```bash
-   parser/.venv/bin/python parser/docx_to_markdown.py rulebooks/<book>.docx -o rulebooks/<book>.md
-   parser/.venv/bin/python parser/markdown_to_structure.py rulebooks/<book>.md -o rulebooks/<book>.structure.json
-   ```
-2. Clear the old ingestion: `cd worker && npm run clear`
-3. Run the ingest script (see `README.md` section 4).
-
-### Full iteration cycle (clear + reparse + redeploy + reingest)
-
-Use the `iterate` npm script to run the full cycle in one command:
-
-```bash
-cd worker && npm run iterate              # blocks until ingestion completes
-cd worker && npm run iterate -- --no-watch # starts ingestion in background
-cd worker && npm run iterate -- --stage metadata  # run only the metadata phase
-```
-
-This runs `npm run clear`, reparses `structure.json`, deploys the worker,
-and starts a fresh ingestion. Use this instead of running the individual
-steps manually when iterating on the pipeline.
+1. Clear the old ingestion: `cd worker && npm run clear`
+2. Run the ingest script (see `README.md` section 4). It re-renders the PDF
+   and re-uploads changed page images automatically.
 
 ### Run a single ingestion stage
 
-The ingest script supports `--stage` to run only one phase. When a stage is
-specified, the worker first resets that stage to a clean state (clearing its
-outputs and all downstream stages' outputs), then runs it:
+The ingest script supports `--stage` to run only one phase. The vision phase
+is Queue-driven — `--stage vision` resets the vision stage and re-enqueues all
+pages to the vision Queue. Post-vision stages (summary, metadata, relations)
+are advanced via `POST /ingest/step`:
 
 ```bash
-cd worker && npm run ingest -- --stage units      # re-parse + re-detect all units (fresh job)
-cd worker && npm run ingest -- --stage summary    # re-generate summaries + embeddings (clears summary+metadata+relations)
-cd worker && npm run ingest -- --stage metadata   # re-extract metadata (clears metadata+relations)
-cd worker && npm run ingest -- --stage relations  # re-extract relations (clears relations only)
+cd worker && npm run ingest -- --input rulebooks/deorim_rules.pdf  # full ingestion (vision + all stages)
+cd worker && npm run ingest -- --input rulebooks/deorim_rules.pdf --pages 5-10  # only pages 5-10
+cd worker && npm run ingest -- --input rulebooks/deorim_rules.pdf --pages 1,3,5-10  # specific pages
+cd worker && npm run ingest -- --stage vision     # re-run vision extraction (resets + re-enqueues pages)
+cd worker && npm run ingest -- --stage summary    # re-generate summaries + embeddings
+cd worker && npm run ingest -- --stage metadata   # re-extract metadata
+cd worker && npm run ingest -- --stage relations  # re-extract relations
 ```
 
-`--stage units` re-parses the rulebook (runs the Python parser to regenerate
-structure.json), uploads it, and creates a fresh job — no existing job needed.
-Other stages resume from the existing state file and require a prior run.
-The worker skips ahead to the requested phase and stops after it completes.
+The `--pages` flag accepts comma-separated ranges (e.g. `5-10`, `1,3,5-10`, `7`).
+Only those pages are rendered, uploaded, and enqueued to the vision Queue. This is
+useful for testing the vision stage on a subset of pages without ingesting the full
+document. Post-vision stages always process all units in the database.
+
+Note: `--input` is required for all stages. For post-vision stages (`summary`, `metadata`,
+`relations`), the script skips parsing and uploading — it uses the existing R2 data and
+resumes from the state file. Use `--skip-parse` and `--skip-upload` to further control this.
 
 **What gets cleared per stage:**
-- `units`: semantic_units, embeddings, relations, concepts, keywords (full reset, keeps structure_nodes)
-- `summary`: summaries, embeddings, metadata, relations, concepts, keywords; resets status to `pending`
-- `metadata`: metadata, relations, concepts, keywords; resets status to `summary_done`
+- `vision`: semantic_units, embeddings, relations; resets job to vision phase and re-enqueues pages
+- `summary`: summaries, embeddings, metadata, relations; resets status to `pending`
+- `metadata`: metadata, relations; resets status to `summary_done`
 - `relations`: relations only; resets status to `metadata_done`
 
 ## Architecture
 
-- `parser/` (Python) — Phases 1-2: DOCX -> Markdown -> hierarchical `structure.json`. Deterministic, no LLM.
-- `worker/` (TypeScript, Cloudflare Workers) — Phases 3-9: semantic unit detection, metadata, relationships, embeddings, graph, retrieval, Q&A.
+- `worker/` (TypeScript, Cloudflare Workers) — Phases 1-5: vision extraction (page images →
+  semantic units), summary + embeddings, metadata extraction, relationship extraction (vector
+  search + deterministic hierarchy). Phases 6-8: agentic retrieval (router → decompose →
+  retrieve → sufficiency loop → answer), citation-aware answer generation.
+- System dependencies: `poppler-utils` (`pdftoppm`, `pdfinfo`) for PDF rendering.
 
-### Node types in the structure tree
+### Vision-based extraction pipeline
 
-`document` > `chapter` > `section` > `subsection` > `group` > (`rule` | `table` | `note` | `image`)
+The vision pipeline uses a vision-language model that reads page images directly:
 
-`group` nodes are structural containers for colon-introduced lists (a `:`-ending
-line followed by bold/numbered/bullet items). They are NOT leaf types, so Phase
-3 skips them and processes their children as individual units. This prevents
-category labels (e.g. "Основные:") from becoming orphan units and stops later
-category labels from bleeding into the last entry of the previous group.
+1. **Render**: PDF pages → PNG images (via `pdftoppm`, 200 DPI)
+2. **Upload**: Page images → R2 (`pages/{docId}/{page}.png`) — unchanged images are skipped via hash check
+3. **Enqueue**: `POST /ingest` enqueues all pages to the vision Queue (max_concurrency=1, FIFO)
+4. **Extract** (Queue handler): Each page image → vision model → `VisionUnit[]` + continuation state
+5. **Post-vision phases**: summary → metadata → relations (advanced via `POST /ingest/step`)
 
-### Table unitization (Phase 3)
+### Testing vision extraction
 
-Table nodes are processed through a double-tree (row tree + column tree) pipeline
-in `worker/src/pipeline/table_tree.ts`:
-
-1. **`buildRowSkeleton`** (deterministic) — parses markdown table, classifies rows
-   as structural/header/data based on merged cells and `---` separators.
-2. **`refineRowSkeleton`** (LLM) — reclassifies rows, reparents for section
-   hierarchies, chains name→description rows. Visual collapse guarded by
-   fill-ratio < 0.7.
-3. **`detectColumnTree`** (LLM) — determines if columns are SPLIT (independent
-   sub-tables) or SIMPLE (properties of one entity).
-4. **`deduplicateColumnHeaders`** (deterministic) — removes duplicate column tree
-   nodes covering the same columns (fixes MULTI-MERGED tables).
-5. **`buildTableUnitsFromTree`** (deterministic) — creates semantic units from the
-   double-tree, with row-width column filtering and per-row deduplication.
-
-### Testing table unitization
-
-Single-table testing via the `/ingest/table` API endpoint:
+Single-page testing via the `/ingest/vision/test` API endpoint:
 
 ```bash
-node worker/scripts/ingest-table.mjs --url https://api.slitherer.workers.dev \
-  --structure rulebooks/deorim_rules.structure.json --node-id TABLE-00005 \
-  --api-key "$ADMIN_API_KEY"
-```
+# Test extraction on a single page image (no DB writes)
+curl -X POST https://api.slitherer.workers.dev/ingest/vision/test \
+  -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"image": "<base64>", "page": 7}'
 
-Batch testing all tables (parallel, ~60s):
-
-```python
-# See /tmp/process_all_v3.py for the batch script pattern
+# Test with DB writes (stores units for debug frontend review)
+curl -X POST https://api.slitherer.workers.dev/ingest/vision/test \
+  -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"image": "<base64>", "page": 7, "writeToDb": true, "documentId": "test"}'
 ```
 
 ### Verification commands
@@ -170,7 +172,8 @@ files under `config/`:
 
 - `config/ingestion.yaml` — pipeline thresholds, batch sizes, LLM temperatures, all prompts
 - `config/retrieval.yaml` — retrieval thresholds, graph hops, prompts
-- `config/client.yaml` — CORS settings, UI feature flags
+- `config/pages.yaml` — client/debug site URLs, UI feature flags
+- `config/worker.yaml` — worker URL, CORS headers
 
 A build-time codegen script (`worker/scripts/gen-config.mjs`) reads the YAML
 and generates `worker/src/config.gen.ts` (gitignored), which is imported by
