@@ -155,7 +155,8 @@ function parseArgs(argv) {
 const args = parseArgs(process.argv.slice(2));
 const statePath = resolve(process.cwd(), args.state);
 const logPath = resolve(process.cwd(), args.log);
-const renderDir = resolve(process.cwd(), "rulebooks", ".render", args.documentId);
+const REPO_DIR = resolve(WORKER_DIR, "..");
+const renderDir = resolve(REPO_DIR, "rulebooks", ".render", args.documentId);
 
 // Check system dependencies (only needed for full ingestion with rendering)
 if (!args.stage && !args.statusOnly) {
