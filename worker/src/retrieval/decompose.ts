@@ -14,6 +14,8 @@ const DECOMPOSE_SCHEMA: Record<string, unknown> = {
       maxItems: MAX_SUB_QUERIES,
     },
     rerank_threshold: { type: "number" },
+    is_list_query: { type: "boolean" },
+    query_complexity: { type: "string", enum: ["simple", "complex"] },
   },
   required: ["sub_queries", "rerank_threshold"],
 };
@@ -23,18 +25,30 @@ const SYSTEM_PROMPT = RETRIEVAL.prompts.decompose.text;
 export async function decompose(
   env: Env,
   russianQuery: string,
-  history: ConversationMessage[] = []
+  history: ConversationMessage[] = [],
+  originalQuery?: string,
+  entities?: string[],
 ): Promise<DecomposeResult> {
   const historyText = history.length > 0
     ? `\n\nConversation history (for context, last ${history.length} messages):\n${history.map((m) => `${m.role}: ${m.content}`).join("\n")}`
     : "";
 
-  const userPrompt = `Question: ${russianQuery}${historyText}`;
+  // Phase 8: Include original query and entities for context
+  const originalText = originalQuery && originalQuery !== russianQuery
+    ? `\n\nOriginal query (in user's language): ${originalQuery}`
+    : "";
+  const entitiesText = entities && entities.length > 0
+    ? `\n\nExtracted entities (proper nouns, abbreviations, numbers, dice notation, item names, acronyms, game terminology — preserve these exactly in sub-queries): ${entities.join(", ")}`
+    : "";
+
+  const userPrompt = `Question: ${russianQuery}${originalText}${entitiesText}${historyText}`;
 
   try {
     const result = await llmJson<{
       sub_queries: string[];
       rerank_threshold: number;
+      is_list_query?: boolean;
+      query_complexity?: "simple" | "complex";
     }>(env, SYSTEM_PROMPT, userPrompt, {
       model: env.REASONING_MODEL,
       schema: DECOMPOSE_SCHEMA,
@@ -49,7 +63,12 @@ export async function decompose(
       ? Math.max(0, Math.min(1, result.rerank_threshold))
       : FALLBACK_RERANK_THRESHOLD;
 
-    return { subQueries, rerankThreshold: threshold };
+    return {
+      subQueries,
+      rerankThreshold: threshold,
+      isListQuery: result.is_list_query === true,
+      queryComplexity: result.query_complexity === "complex" ? "complex" : "simple",
+    };
   } catch (err) {
     throw new Error(`Decomposition failed: ${String(err)}`);
   }

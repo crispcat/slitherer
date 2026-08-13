@@ -12,6 +12,11 @@ const ROUTER_SCHEMA: Record<string, unknown> = {
     language: { type: "string" },
     russian_query: { type: "string" },
     chat_response: { type: "string" },
+    entities: {
+      type: "array",
+      items: { type: "string" },
+      description: "Proper nouns, abbreviations, numbers, dice notation, item names, acronyms, and game terminology preserved from the original query",
+    },
   },
   required: ["rag", "language", "russian_query"],
 };
@@ -36,6 +41,7 @@ export async function route(
       language: string;
       russian_query: string;
       chat_response?: string;
+      entities?: string[];
     }>(env, SYSTEM_PROMPT, userPrompt, {
       model: env.EXTRACTION_MODEL,
       schema: ROUTER_SCHEMA,
@@ -44,7 +50,9 @@ export async function route(
     return {
       rag: result.rag ?? FALLBACK_RAG,
       language: result.language ?? FALLBACK_LANGUAGE,
+      originalQuery: question,
       russianQuery: result.russian_query ?? question,
+      entities: result.entities ?? [],
       chatResponse: result.chat_response,
     };
   } catch (err) {
@@ -52,7 +60,9 @@ export async function route(
     return {
       rag: FALLBACK_RAG,
       language: FALLBACK_LANGUAGE,
+      originalQuery: question,
       russianQuery: question,
+      entities: [],
     };
   }
 }

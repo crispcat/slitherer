@@ -28,9 +28,7 @@
   const paramMode = $("param-mode");
   const paramStream = $("param-stream");
   const paramDebug = $("param-debug");
-  const paramGraphHops = $("param-graph-hops");
   const paramMaxIterations = $("param-max-iterations");
-  const graphHopsVal = $("graph-hops-val");
   const maxIterationsVal = $("max-iterations-val");
   const connectionStatus = $("connection-status");
   const connectionText = $("connection-text");
@@ -262,7 +260,6 @@
       mode: paramMode.value,
       stream: paramStream.checked,
       debug: paramDebug.checked,
-      graphHops: parseInt(paramGraphHops.value, 10),
       maxIterations: parseInt(paramMaxIterations.value, 10),
     };
   }
@@ -655,10 +652,6 @@
   });
 
   inputEl.addEventListener("input", autoResize);
-
-  paramGraphHops.addEventListener("input", () => {
-    graphHopsVal.textContent = paramGraphHops.value;
-  });
 
   paramMaxIterations.addEventListener("input", () => {
     maxIterationsVal.textContent = paramMaxIterations.value;

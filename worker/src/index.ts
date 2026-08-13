@@ -1,6 +1,6 @@
 import type { Env, ConversationMessage, QueueMessage } from "./types";
-import { processIngestionBatch, processVisionPage, rebuildAllRelationships, startIngestion, INGEST_STAGES } from "./pipeline/ingest";
-import { cleanupDocument, getIngestionJob, getLastConversationTurns, logQueryStep, logDebug, resetIngestionStage, getAllUnits, getSourceNodesWithUnits, getUnitDetails, getDebugLogs, clearDebugLogs, updateUnit } from "./utils/db";
+import { processIngestionBatch, processVisionPage, rebuildAllConcepts, startIngestion, INGEST_STAGES } from "./pipeline/ingest";
+import { cleanupDocument, getIngestionJob, getLastConversationTurns, logQueryStep, logDebug, resetIngestionStage, getAllUnits, getSourceNodesWithUnits, getUnitDetails, getDebugLogs, clearDebugLogs, updateUnit, getCandidateLogs, clearCandidateLogs, logCandidate } from "./utils/db";
 import { runQuery, runQueryStream } from "./retrieval/pipeline";
 import { route, generateChatResponse } from "./retrieval/router";
 import { decompose } from "./retrieval/decompose";
@@ -123,9 +123,9 @@ export default {
       }
 
       // POST /ingest/step { jobId, batchSize?, stage? }
-      // Advances an ingestion job by one batch for the summary/metadata/relations phases.
+      // Advances an ingestion job by one batch for the summary/metadata/embedding/concepts phases.
       // The vision phase is Queue-driven — call this to advance post-vision phases.
-      // If stage is specified (e.g. "summary", "metadata", "relations"),
+      // If stage is specified (e.g. "summary", "metadata", "embedding", "concepts"),
       // skips ahead to that phase and stops after it completes.
       if (url.pathname === "/ingest/step" && request.method === "POST") {
         const body = await request.json<any>();
@@ -134,10 +134,12 @@ export default {
         if (stage && !INGEST_STAGES.includes(stage)) {
           return json({ error: `Invalid stage: ${stage}. Valid stages: ${INGEST_STAGES.join(", ")}` }, 400);
         }
+        const pages = Array.isArray(body.pages) ? body.pages : null;
         const result = await processIngestionBatch(
           env, jobId,
           body.batchSize ?? INGESTION.ingestion.batchSizes.summary.value,
-          stage
+          stage,
+          pages
         );
         return json(result);
       }
@@ -196,7 +198,7 @@ export default {
       // POST /ingest/reset-stage { documentId, stage }
       // Clears the outputs of the specified stage AND all downstream stages,
       // then resets unit statuses so the stage can be re-run from clean state.
-      // Stages: vision | summary | metadata | relations
+      // Stages: vision | summary | metadata | embedding | concepts
       // For "vision": also re-enqueues all pages to the vision Queue.
       if (url.pathname === "/ingest/reset-stage" && request.method === "POST") {
         const body = await request.json<any>();
@@ -206,7 +208,8 @@ export default {
         if (!stage || !INGEST_STAGES.includes(stage as any)) {
           return json({ error: `Invalid stage: ${stage}. Valid stages: ${INGEST_STAGES.join(", ")}` }, 400);
         }
-        await resetIngestionStage(env, documentId, stage);
+        const pages = Array.isArray(body.pages) ? body.pages : null;
+        await resetIngestionStage(env, documentId, stage, pages);
 
         // For vision reset: re-enqueue pages to the vision Queue
         if (stage === "vision") {
@@ -220,17 +223,19 @@ export default {
           if (!totalPages || totalPages < 1) {
             return json({ error: "totalPages not found in job detail" }, 400);
           }
-          const pagesToEnqueue = Array.isArray(detail.pages) ? detail.pages : Array.from({ length: totalPages }, (_, i) => i + 1);
+          // If pages scope was provided, only re-enqueue those pages.
+          // Otherwise, re-enqueue all pages from the job's page list (or 1..totalPages).
+          const pagesToEnqueue = pages ?? (Array.isArray(detail.pages) ? detail.pages : Array.from({ length: totalPages }, (_, i) => i + 1));
           const messages: { body: QueueMessage }[] = [];
           for (const page of pagesToEnqueue) {
             messages.push({ body: { jobId, documentId, pageNumber: page } });
           }
           await env.VISION_QUEUE.sendBatch(messages);
           await logDebug(env, "info", "ingestion:vision", `Re-enqueued ${pagesToEnqueue.length} pages after vision reset`, { jobId, documentId, pages: pagesToEnqueue });
-          return json({ ok: true, documentId, stage, reEnqueued: pagesToEnqueue.length, jobId });
+          return json({ ok: true, documentId, stage, reEnqueued: pagesToEnqueue.length, jobId, pages: pagesToEnqueue });
         }
 
-        return json({ ok: true, documentId, stage });
+        return json({ ok: true, documentId, stage, pages: pages ?? undefined });
       }
 
       // POST /ingest/vision/test { image: base64, page: number, continuation?, writeToDb?, documentId? }
@@ -291,17 +296,16 @@ export default {
         });
       }
 
-      // POST /ingest/rebuild-relations { batchSize?, cursor? }
-      // Second pass over Phase 5 across the whole knowledge base (see
-      // pipeline/ingest.ts:rebuildAllRelationships for rationale).
-      if (url.pathname === "/ingest/rebuild-relations" && request.method === "POST") {
+      // POST /ingest/rebuild-concepts { batchSize?, cursor? }
+      // Second pass over the whole knowledge base to rebuild concepts.
+      if (url.pathname === "/ingest/rebuild-concepts" && request.method === "POST") {
         const body = await request.json<any>().catch(() => ({}));
-        const result = await rebuildAllRelationships(env, body.batchSize ?? INGESTION.ingestion.batchSizes.rebuildRelations.value, body.cursor ?? 0);
+        const result = await rebuildAllConcepts(env, body.batchSize ?? INGESTION.ingestion.batchSizes.concepts.value, body.cursor ?? 0);
         return json(result);
       }
 
 
-      // POST /query { question, conversationId?, stream?, debug?, graphHops?, maxIterations? }
+      // POST /query { question, conversationId?, stream?, debug?, maxIterations? }
       // Full agentic retrieval pipeline: router → decompose → retrieve → sufficiency loop → answer.
       // All-in-one endpoint. For step-by-step execution, use the /query/* endpoints below.
       if (url.pathname === "/query" && request.method === "POST") {
@@ -321,7 +325,6 @@ export default {
                   conversationId: body.conversationId,
                   stream: true,
                   debug: body.debug === true,
-                  graphHops: body.graphHops,
                   maxIterations: body.maxIterations,
                 });
 
@@ -363,7 +366,6 @@ export default {
         const { result, retrieved } = await runQuery(env, question, {
           conversationId: body.conversationId,
           debug: body.debug === true,
-          graphHops: body.graphHops,
           maxIterations: body.maxIterations,
         });
 
@@ -412,8 +414,9 @@ export default {
         return json({ ...result, durationMs });
       }
 
-      // POST /query/decompose { russianQuery, conversationId? }
+      // POST /query/decompose { russianQuery, originalQuery?, entities?, conversationId? }
       // Step 2: Query decomposition into sub-queries + dynamic rerank threshold.
+      // Phase 8: Accept originalQuery and entities for cross-language preservation.
       if (url.pathname === "/query/decompose" && request.method === "POST") {
         const body = await request.json<any>();
         const russianQuery: string = body.russianQuery;
@@ -424,19 +427,19 @@ export default {
           : [];
 
         const start = Date.now();
-        const result = await decompose(env, russianQuery, history);
+        const result = await decompose(env, russianQuery, history, body.originalQuery, body.entities);
         const durationMs = Date.now() - start;
         console.log(`[/query/decompose] ${result.subQueries.length} sub-queries threshold=${result.rerankThreshold} duration=${durationMs}ms`);
 
         if (body.conversationId) {
-          await logQueryStep(env, "decompose", { russianQuery }, result, durationMs, body.conversationId);
+          await logQueryStep(env, "decompose", { russianQuery, originalQuery: body.originalQuery, entities: body.entities }, result, durationMs, body.conversationId);
         }
 
         return json({ ...result, durationMs });
       }
 
-      // POST /query/retrieve { subQueries, rerankThreshold?, graphHops?, existingIds? }
-      // Step 3+4: Multi-sub-query retrieval + per-sub-query rerank + threshold filter.
+      // POST /query/retrieve { subQueries, rerankThreshold?, existingIds? }
+      // Step 3+4: Hybrid retrieval (subject + content + lexical, RRF-fused) + per-sub-query rerank + threshold filter.
       if (url.pathname === "/query/retrieve" && request.method === "POST") {
         const body = await request.json<any>();
         const subQueries: string[] = body.subQueries;
@@ -446,7 +449,6 @@ export default {
 
         const start = Date.now();
         const retrieved = await retrieve(env, subQueries, {
-          graphHops: body.graphHops,
           rerankThreshold: body.rerankThreshold,
           existingIds: body.existingIds ? new Set(body.existingIds) : undefined,
         });
@@ -553,6 +555,40 @@ export default {
         return json({ sources });
       }
 
+      // GET /debug/concepts
+      // Lists all concepts with their aliases and mention counts.
+      // Used by the debug viewer to visualize the concept layer.
+      if (url.pathname === "/debug/concepts" && request.method === "GET") {
+        const { results: concepts } = await env.DB.prepare(
+          `SELECT c.id, c.canonical_name, c.description, c.created_at,
+             (SELECT COUNT(*) FROM concept_aliases a WHERE a.concept_id = c.id) as alias_count,
+             (SELECT COUNT(*) FROM concept_mentions m WHERE m.concept_id = c.id) as mention_count
+           FROM concepts c
+           ORDER BY c.canonical_name`
+        ).all();
+        return json({ concepts: concepts ?? [] });
+      }
+
+      // GET /debug/concepts/:id
+      // Returns detailed information about a single concept, including aliases and mentions.
+      if (url.pathname.startsWith("/debug/concepts/") && request.method === "GET") {
+        const conceptId = url.pathname.replace("/debug/concepts/", "");
+        const concept = await env.DB.prepare(`SELECT * FROM concepts WHERE id = ?`).bind(conceptId).first();
+        if (!concept) return json({ error: "Concept not found" }, 404);
+        const [aliases, mentions] = await Promise.all([
+          env.DB.prepare(`SELECT alias, source, confidence FROM concept_aliases WHERE concept_id = ?`).bind(conceptId).all(),
+          env.DB.prepare(
+            `SELECT cm.id, cm.unit_id, cm.raw_term, cm.mention_type, cm.confidence, cm.resolution_method, cm.created_at,
+                    su.name as unit_name, su.type as unit_type
+             FROM concept_mentions cm
+             JOIN semantic_units su ON su.id = cm.unit_id
+             WHERE cm.concept_id = ?
+             ORDER BY cm.created_at`
+          ).bind(conceptId).all(),
+        ]);
+        return json({ concept, aliases: aliases.results ?? [], mentions: mentions.results ?? [] });
+      }
+
       // GET /debug/tree?format=tree|flat&sourceNodeId=<id>
       // Returns the semantic unit hierarchy for visualization.
       // - format=flat (default): array of {id, parentId, type, name, section, status}
@@ -594,7 +630,7 @@ export default {
 
       // GET /debug/unit/:id
       // Returns comprehensive data for a single unit: all fields, metadata,
-      // relations (outgoing + incoming), parent/child units,
+      // concept mentions, parent/child units,
       // and the source structure node. Used by the tree viewer side panel.
       {
         const unitMatch = url.pathname.match(/^\/debug\/unit\/(.+)$/);
@@ -639,6 +675,24 @@ export default {
       // Clears all debug log entries.
       if (url.pathname === "/debug/logs" && request.method === "DELETE") {
         await clearDebugLogs(env);
+        return json({ ok: true });
+      }
+
+      // GET /debug/candidates?query=<text>&limit=<n>
+      // Phase 10: Returns candidate logs for a specific query — per-stage
+      // candidate data and provenance for diagnostics.
+      if (url.pathname === "/debug/candidates" && request.method === "GET") {
+        const query = url.searchParams.get("query") ?? "";
+        const limit = parseInt(url.searchParams.get("limit") ?? "200", 10);
+        if (!query) return json({ error: "query parameter is required" }, 400);
+        const logs = await getCandidateLogs(env, query, limit);
+        return json({ logs });
+      }
+
+      // DELETE /debug/candidates
+      // Phase 10: Clears all candidate log entries.
+      if (url.pathname === "/debug/candidates" && request.method === "DELETE") {
+        await clearCandidateLogs(env);
         return json({ ok: true });
       }
 

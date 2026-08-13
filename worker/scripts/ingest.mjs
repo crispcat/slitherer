@@ -6,7 +6,7 @@
  *   1. Render PDF pages to PNG images (via pdftoppm/poppler-utils)
  *   2. Upload page images to R2 (pages/{documentId}/{page}.png) — skip unchanged
  *   3. POST /ingest { documentId, sourcePath, totalPages, pages? } — enqueues pages to vision Queue
- *   4. Poll POST /ingest/step for summary/metadata/relations phases
+ *   4. Poll POST /ingest/step for summary/metadata/embedding/concepts phases
  *
  * Usage:
  *   node scripts/ingest.mjs \
@@ -20,19 +20,25 @@
  *   node scripts/ingest.mjs --input ../rulebooks/deorim_rules.pdf --pages 1,3,5-10
  *   node scripts/ingest.mjs --input ../rulebooks/deorim_rules.pdf --pages 7
  *
- *   # Stop after vision phase (skip summary/metadata/relations):
+ *   # Stop after vision phase (skip summary/metadata/embedding/concepts):
  *   node scripts/ingest.mjs --input ../rulebooks/deorim_rules.pdf --pages 1-5 --vision-only
  *
  *   # Run only a specific stage:
  *   node scripts/ingest.mjs --stage vision     # re-run vision extraction (re-enqueues pages)
  *   node scripts/ingest.mjs --stage summary
  *   node scripts/ingest.mjs --stage metadata
- *   node scripts/ingest.mjs --stage relations
+ *   node scripts/ingest.mjs --stage embedding
+ *   node scripts/ingest.mjs --stage concepts
  *
- * Re-running with the same --state file resumes an in-progress or failed job.
+ *   # Page-scoped stage reset (only reset + re-run units on specific pages):
+ *   node scripts/ingest.mjs --stage vision --pages 7-10    # re-extract vision for pages 7-10 only
+ *   node scripts/ingest.mjs --stage metadata --pages 7-10  # re-extract metadata for pages 7-10 only
+ *   node scripts/ingest.mjs --stage concepts --pages 7-10  # re-extract concepts for pages 7-10's units
+ *
+ * Re-running with the same state file resumes an in-progress or failed job.
  */
 
-import { readFile, writeFile, appendFile, access, readdir, unlink } from "node:fs/promises";
+import { readFile, writeFile, appendFile, access, readdir } from "node:fs/promises";
 import { readFileSync, existsSync, readdirSync, renameSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { resolve, dirname, join } from "node:path";
@@ -88,7 +94,7 @@ function parseArgs(argv) {
     maxRetries: 5,
     statusOnly: false,
     fresh: false,
-    stage: null, // null = run all stages; otherwise "vision"|"summary"|"metadata"|"relations"
+    stage: null, // null = run all stages; otherwise "vision"|"summary"|"metadata"|"embedding"|"concepts"
     visionOnly: false, // stop after vision phase completes
     pages: null, // null = all pages; otherwise array of 1-indexed page numbers
     apiKey: process.env.ADMIN_API_KEY ?? null,
@@ -144,7 +150,7 @@ function parseArgs(argv) {
     console.error("Missing admin API key. Pass --api-key <key>, set ADMIN_API_KEY env var, or put it in worker/.dev.vars.");
     process.exit(1);
   }
-  const VALID_STAGES = ["vision", "summary", "metadata", "relations"];
+  const VALID_STAGES = ["vision", "summary", "metadata", "embedding", "concepts"];
   if (args.stage && !VALID_STAGES.includes(args.stage)) {
     console.error(`Invalid --stage: ${args.stage}. Valid stages: ${VALID_STAGES.join(", ")}`);
     process.exit(1);
@@ -155,7 +161,6 @@ function parseArgs(argv) {
 const args = parseArgs(process.argv.slice(2));
 const statePath = resolve(process.cwd(), args.state);
 const logPath = resolve(process.cwd(), args.log);
-const REPO_DIR = resolve(WORKER_DIR, "..");
 const renderDir = resolve(REPO_DIR, "rulebooks", ".render", args.documentId);
 
 // Check system dependencies (only needed for full ingestion with rendering)
@@ -385,9 +390,13 @@ async function main() {
     }
 
     // Reset the requested stage
-    await log("STAGE", `Resetting stage '${args.stage}' to clean state`, { documentId: args.documentId });
+    await log("STAGE", `Resetting stage '${args.stage}' to clean state`, {
+      documentId: args.documentId,
+      pages: args.pages ?? "all",
+    });
     const resetBody = { documentId: args.documentId, stage: args.stage };
     if (args.stage === "vision") resetBody.jobId = state.jobId;
+    if (args.pages) resetBody.pages = args.pages;
     const resetResult = await withRetry(
       () => postJson("/ingest/reset-stage", resetBody),
       "POST /ingest/reset-stage"
@@ -441,6 +450,7 @@ async function main() {
     while (true) {
       const stepBody = { jobId: state.jobId, batchSize: 5 };
       if (args.stage) stepBody.stage = args.stage;
+      if (args.pages) stepBody.pages = args.pages;
       const result = await withRetry(
         () => postJson("/ingest/step", stepBody),
         "POST /ingest/step"
@@ -578,7 +588,7 @@ async function main() {
     await log("STAGE", "Resuming existing ingestion job from state file", state);
   }
 
-  // Step 6: Poll for vision phase completion, then run post-vision stages
+  // Step 4: Poll for vision phase completion, then run post-vision stages
   let lastPhase = state.phase;
   let lastPages = -1;
   let lastUnits = -1;

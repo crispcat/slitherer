@@ -1,7 +1,9 @@
 export interface Env {
   AI: Ai;
   DB: D1Database;
-  VECTORIZE_INDEX: VectorizeIndex;
+  VECTORIZE_SUBJECTS: VectorizeIndex;
+  VECTORIZE_CONTENT: VectorizeIndex;
+  VECTORIZE_CONCEPTS_IDX: VectorizeIndex;
   slitherer_rag_storage: R2Bucket;
   VISION_QUEUE: Queue<QueueMessage>;
   EMBEDDING_MODEL: string;
@@ -38,8 +40,11 @@ export interface StructureNode {
 // ---- Phase 3: semantic units ----
 export const SEMANTIC_UNIT_TYPES = [
   "Rule",
-  "Table",
   "Image",
+  "DataTableHeader",
+  "DataTableRow",
+  "ColumnListTable",
+  "ColumnListItem",
 ] as const;
 export type SemanticUnitType = (typeof SEMANTIC_UNIT_TYPES)[number];
 
@@ -57,57 +62,54 @@ export interface SemanticUnit {
   contentHash: string;
   summary?: string;
   metadata?: UnitMetadata;
-  embeddingId?: string;
-  status: "pending" | "summary_done" | "metadata_done" | "relations_done" | "done";
+  metadataTermsText?: string;   // flattened metadata terms for FTS5 (Phase 2)
+  sectionPathText?: string;     // section path joined with " > " for FTS5 (Phase 2)
+  aliasesText?: string;         // aliases joined with ", " for FTS5 (Phase 2)
+  subjectEmbeddingId?: string;
+  contentEmbeddingId?: string;
+  status: "pending" | "summary_done" | "metadata_done" | "embedding_done" | "done";
   updatedAt: string;
 }
 
 // ---- Phase 4: metadata ----
 export interface UnitMetadata {
   defines: string[];
-  references: string[];
-  requires: string[];
-  exceptions: string[];
-  modifies: string[];
-  modified_by: string[];
-  overrides: string[];
-  related_to: string[];
-  incompatible_with: string[];
-  creates: string[];
-  consumes: string[];
-  supersedes: string[];
-  example_of: string[];
-  part_of: string[];
+  mentions: string[];
   aliases: string[];
 }
 
-// ---- Phase 5: relationships ----
-export const RELATION_TYPES = [
-  "defines",
-  "references",
-  "requires",
-  "excepts",
-  "modifies",
-  "modified_by",
-  "overrides",
-  "related_to",
-  "incompatible_with",
-  "creates",
-  "consumes",
-  "supersedes",
-  "example_of",
-  "part_of",
-  "parent_of",
-  "child_of",
-] as const;
-export type RelationType = (typeof RELATION_TYPES)[number];
+// ---- Phase 3: concepts ----
 
-export interface Relation {
+export interface Concept {
   id: string;
-  source: string;
-  target: string;
-  relation_type: RelationType;
+  documentId: string;
+  canonicalName: string;
+  description?: string;
+  embeddingId?: string;
+  sourceUnitIds?: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConceptAlias {
+  conceptId: string;
+  alias: string;
+  normalizedAlias: string;
+  language?: string;
+  source?: string;
   confidence: number;
+}
+
+export interface ConceptMention {
+  id: string;
+  conceptId: string;
+  unitId: string;
+  rawTerm: string;
+  normalizedTerm: string;
+  mentionType: string;
+  confidence: number;
+  resolutionMethod: "exact_alias" | "normalized_alias" | "embedding" | "llm_validation" | "manual";
+  createdAt: string;
 }
 
 // ---- Query pipeline ----
@@ -125,7 +127,13 @@ export interface ConversationMessage {
 export interface RouterResult {
   rag: boolean;
   language: string;
+  /** Phase 8: The original user query, preserved as-is. */
+  originalQuery: string;
+  /** The translated Russian query (used for retrieval). */
   russianQuery: string;
+  /** Phase 8: Extracted entities — proper nouns, abbreviations, numbers, dice notation,
+   *  item names, acronyms, and game terminology that should be preserved across translation. */
+  entities?: string[];
   /** Present when rag=false — the direct chat response. */
   chatResponse?: string;
 }
@@ -133,13 +141,45 @@ export interface RouterResult {
 export interface DecomposeResult {
   subQueries: string[];
   /** Dynamic rerank threshold — precise questions get higher (0.4-0.5),
-   *  exploratory questions get lower (0.2-0.3). */
+   *  exploratory questions get lower (0.2-0.3).
+   *  Phase 6: This is now ignored by the retrieval pipeline — server-controlled
+   *  threshold is used instead. Kept for backward compatibility. */
   rerankThreshold: number;
+  /** Phase 7: Whether this is a list/enumeration query (e.g. "list all weapons").
+   *  List queries skip the normal evidence budget cap. */
+  isListQuery?: boolean;
+  /** Phase 9: Query complexity classification — "simple" or "complex".
+   *  Complex queries use iterative retrieval as the primary mechanism. */
+  queryComplexity?: "simple" | "complex";
+}
+
+/** Phase 9: Categorized sufficiency gap types. */
+export type GapType =
+  | "missing_exception"
+  | "missing_prerequisite"
+  | "missing_interaction"
+  | "missing_table_dimension"
+  | "missing_definition"
+  | "contradictory_evidence"
+  | "missing_step"
+  | "missing_dependency"
+  | "missing_category_member"
+  | "other";
+
+export interface SufficiencyGap {
+  type: GapType;
+  description: string;
+  /** Which specific entity/concept the gap is about. */
+  target?: string;
+  /** Suggested follow-up query to fill this gap. */
+  followUpQuery?: string;
 }
 
 export interface SufficiencyResult {
   sufficient: boolean;
   gaps: string[];
+  /** Phase 9: Categorized gaps with type, description, and targeted follow-up. */
+  categorizedGaps?: SufficiencyGap[];
   followUpQueries: string[];
 }
 

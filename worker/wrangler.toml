@@ -21,8 +21,16 @@ database_name = "slitherer-rag-db"
 database_id = "acca8b79-5e74-4fc4-b174-d98c650f1494"
 
 [[vectorize]]
-binding = "VECTORIZE_INDEX"
-index_name = "slitherer-rag-units"
+binding = "VECTORIZE_SUBJECTS"
+index_name = "slitherer-rag-subjects"
+
+[[vectorize]]
+binding = "VECTORIZE_CONTENT"
+index_name = "slitherer-rag-content"
+
+[[vectorize]]
+binding = "VECTORIZE_CONCEPTS_IDX"
+index_name = "slitherer-rag-concepts-idx"
 
 [[r2_buckets]]
 bucket_name = "slitherer-rag-storage"

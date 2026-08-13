@@ -30,7 +30,6 @@ async function fullQuery(baseUrl, apiKey, params, { onChunk, onResult, onError, 
     question: params.question,
     conversationId: params.conversationId,
     debug: params.debug,
-    graphHops: params.graphHops,
     maxIterations: params.maxIterations,
   };
 
@@ -123,7 +122,6 @@ async function stagedQuery(baseUrl, apiKey, params, { onStep, onChunk, onResult,
       body: JSON.stringify({
         subQueries: currentSubQueries,
         rerankThreshold: decomposeResult.rerankThreshold,
-        graphHops: params.graphHops,
         existingIds,
       }),
       signal,

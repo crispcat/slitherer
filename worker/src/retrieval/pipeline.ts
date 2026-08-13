@@ -2,6 +2,7 @@ import type { Env, ConversationMessage, QueryDebug, QueryResult, RouterResult, D
 import { route, generateChatResponse } from "./router";
 import { decompose } from "./decompose";
 import { retrieve, RetrievedUnit } from "./query";
+import { selectEvidence, buildEvidenceContext, SelectedEvidence } from "./evidence";
 import { checkSufficiency } from "./sufficiency";
 import { generateAnswer } from "./answer";
 import {
@@ -9,18 +10,18 @@ import {
   getLastConversationTurns,
   logDebug,
   logQueryStep,
+  logCandidate,
 } from "../utils/db";
 import { RETRIEVAL } from "../config.gen";
 
 const HISTORY_TURNS = RETRIEVAL.pipeline.historyTurns.value;
 const MAX_ITERATIONS = RETRIEVAL.pipeline.maxIterations.value;
-const GRAPH_HOPS = RETRIEVAL.pipeline.graphHops.value;
+const MAX_COMPLEX_ITERATIONS = RETRIEVAL.pipeline.maxComplexIterations.value;
 
 export interface PipelineOptions {
   conversationId?: string;
   stream?: boolean;
   debug?: boolean;
-  graphHops?: number;
   maxIterations?: number;
 }
 
@@ -40,7 +41,7 @@ export async function runQuery(
   question: string,
   opts: PipelineOptions = {}
 ): Promise<PipelineResult> {
-  const { conversationId, debug = false, graphHops = GRAPH_HOPS, maxIterations = MAX_ITERATIONS } = opts;
+  const { conversationId, debug = false, maxIterations } = opts;
 
   // Load conversation history (last N turns)
   const history: ConversationMessage[] = conversationId
@@ -85,19 +86,24 @@ export async function runQuery(
     return { result, retrieved: [] };
   }
 
-  // Step 2: Decompose
-  console.log(`[pipeline] Step 2: Decompose — russian_query: "${routerResult.russianQuery.slice(0, 80)}..."`);
+  // Step 2: Decompose — Phase 8: pass both original and translated queries
+  console.log(`[pipeline] Step 2: Decompose — original: "${routerResult.originalQuery.slice(0, 80)}...", russian_query: "${routerResult.russianQuery.slice(0, 80)}..."`);
   const { value: decomposeResult, durationMs: decomposeMs } = await timed(() =>
-    decompose(env, routerResult.russianQuery, history)
+    decompose(env, routerResult.russianQuery, history, routerResult.originalQuery, routerResult.entities)
   );
-  console.log(`[pipeline] Decompose: ${decomposeResult.subQueries.length} sub-queries, threshold=${decomposeResult.rerankThreshold}, duration=${decomposeMs}ms`);
-  await logDebug(env, "info", "retrieval:decompose", `${decomposeResult.subQueries.length} sub-queries`, { durationMs: decomposeMs, threshold: decomposeResult.rerankThreshold });
+  console.log(`[pipeline] Decompose: ${decomposeResult.subQueries.length} sub-queries, threshold=${decomposeResult.rerankThreshold}, list=${decomposeResult.isListQuery}, complexity=${decomposeResult.queryComplexity}, duration=${decomposeMs}ms`);
+  await logDebug(env, "info", "retrieval:decompose", `${decomposeResult.subQueries.length} sub-queries`, { durationMs: decomposeMs, threshold: decomposeResult.rerankThreshold, isListQuery: decomposeResult.isListQuery, queryComplexity: decomposeResult.queryComplexity });
 
   if (conversationId) {
-    await logQueryStep(env, "decompose", { russianQuery: routerResult.russianQuery }, decomposeResult, decomposeMs, conversationId);
+    await logQueryStep(env, "decompose", { originalQuery: routerResult.originalQuery, russianQuery: routerResult.russianQuery, entities: routerResult.entities }, decomposeResult, decomposeMs, conversationId);
   }
 
-  // Iterative retrieval loop
+  // Phase 9: Determine iteration limit based on query complexity
+  const isComplex = decomposeResult.queryComplexity === "complex";
+  const effectiveMaxIterations = maxIterations ?? (isComplex ? MAX_COMPLEX_ITERATIONS : MAX_ITERATIONS);
+  console.log(`[pipeline] Query complexity: ${decomposeResult.queryComplexity ?? "simple"}, max iterations: ${effectiveMaxIterations}`);
+
+  // Iterative retrieval loop — Phase 9: evidence is accumulated across iterations
   const allRetrieved = new Map<string, RetrievedUnit>();
   const allRetrievedIds = new Set<string>();
   const iterations: IterationDebug[] = [];
@@ -105,12 +111,11 @@ export async function runQuery(
   let lastSufficiency: SufficiencyResult | undefined;
   let allGaps: string[] = [];
 
-  for (let iteration = 0; iteration < maxIterations; iteration++) {
+  for (let iteration = 0; iteration < effectiveMaxIterations; iteration++) {
     console.log(`[pipeline] Step 3: Retrieve — iteration ${iteration + 1}, ${currentSubQueries.length} sub-queries`);
 
     const { value: retrieved, durationMs: retrieveMs } = await timed(() =>
       retrieve(env, currentSubQueries, {
-        graphHops,
         rerankThreshold: decomposeResult.rerankThreshold,
         existingIds: allRetrievedIds,
       })
@@ -120,6 +125,23 @@ export async function runQuery(
 
     if (conversationId) {
       await logQueryStep(env, "retrieve", { iteration, subQueries: currentSubQueries }, { count: retrieved.length }, retrieveMs, conversationId);
+    }
+
+    // Phase 10: Log candidates for diagnostics
+    for (const r of retrieved) {
+      await logCandidate(env, {
+        conversationId: conversationId ?? undefined,
+        queryText: question,
+        iteration,
+        stage: "rerank",
+        unitId: r.unit.id,
+        unitName: r.unit.name ?? undefined,
+        unitType: r.unit.type,
+        vectorScore: r.vectorScore,
+        rerankScore: r.rerankScore,
+        finalScore: r.finalScore,
+        provenance: r.provenance ? JSON.stringify(r.provenance) : undefined,
+      });
     }
 
     // Merge into allRetrieved (dedupe by unit id, keep best rerankScore, merge sourceSubQueries)
@@ -145,13 +167,13 @@ export async function runQuery(
     };
 
     // Step 5: Sufficiency check (skip on last iteration — use what we have)
-    if (iteration < maxIterations - 1) {
+    if (iteration < effectiveMaxIterations - 1) {
       console.log(`[pipeline] Step 5: Sufficiency check — iteration ${iteration + 1}`);
       const { value: sufficiency, durationMs: suffMs } = await timed(() =>
         checkSufficiency(env, routerResult.russianQuery, [...allRetrieved.values()], currentSubQueries)
       );
-      console.log(`[pipeline] Sufficiency: sufficient=${sufficiency.sufficient}, gaps=${sufficiency.gaps.length}, duration=${suffMs}ms`);
-      await logDebug(env, "info", "retrieval:sufficiency", `sufficient=${sufficiency.sufficient}, gaps=${sufficiency.gaps.length}`, { durationMs: suffMs, iteration: iteration + 1 });
+      console.log(`[pipeline] Sufficiency: sufficient=${sufficiency.sufficient}, gaps=${sufficiency.gaps.length}, categorizedGaps=${sufficiency.categorizedGaps?.length ?? 0}, duration=${suffMs}ms`);
+      await logDebug(env, "info", "retrieval:sufficiency", `sufficient=${sufficiency.sufficient}, gaps=${sufficiency.gaps.length}`, { durationMs: suffMs, iteration: iteration + 1, categorizedGaps: sufficiency.categorizedGaps?.length ?? 0 });
 
       if (conversationId) {
         await logQueryStep(env, "sufficiency", { iteration: iteration + 1 }, sufficiency, suffMs, conversationId);
@@ -182,17 +204,40 @@ export async function runQuery(
   const retrievedList = [...allRetrieved.values()];
   console.log(`[pipeline] Total retrieved: ${retrievedList.length} units`);
 
-  // Step 6: Answer generation
+  // Phase 7: Evidence selection — select the best evidence from the candidate pool
+  const isListQuery = decomposeResult.isListQuery ?? false;
+  const allUnitsMap = new Map(retrievedList.map((r) => [r.unit.id, r.unit]));
+  const selectedEvidence = selectEvidence(retrievedList, decomposeResult.subQueries.length, isListQuery, allUnitsMap);
+  console.log(`[pipeline] Evidence selected: ${selectedEvidence.length} units (list=${isListQuery})`);
+
+  // Phase 10: Log evidence selection
+  for (const e of selectedEvidence) {
+    await logCandidate(env, {
+      conversationId: conversationId ?? undefined,
+      queryText: question,
+      iteration: -1, // evidence selection is post-iteration
+      stage: "evidence_selection",
+      unitId: e.unit.id,
+      unitName: e.unit.name ?? undefined,
+      unitType: e.unit.type,
+      rerankScore: e.rerankScore,
+      finalScore: e.finalScore,
+      selected: true,
+    });
+  }
+
+  // Step 6: Answer generation — pass selected evidence with hierarchical context
   console.log(`[pipeline] Step 6: Answer generation — language: ${routerResult.language}`);
   const { value: result, durationMs: answerMs } = await timed(() =>
-    generateAnswer(env, question, retrievedList, {
+    generateAnswer(env, question, selectedEvidence.map((e) => ({ unit: e.unit, rerankScore: e.rerankScore } as any)), {
       language: routerResult.language,
       subQueries: decomposeResult.subQueries,
       gaps: allGaps,
-    })
+      evidenceContext: buildEvidenceContext(selectedEvidence),
+    } as any)
   );
   console.log(`[pipeline] Answer: ${result.citations.length} citations, duration=${answerMs}ms`);
-  await logDebug(env, "info", "retrieval:answer", `${result.citations.length} citations`, { durationMs: answerMs, evidenceCount: retrievedList.length });
+  await logDebug(env, "info", "retrieval:answer", `${result.citations.length} citations`, { durationMs: answerMs, evidenceCount: selectedEvidence.length });
 
   if (conversationId) {
     await logQueryStep(env, "answer", { question, language: routerResult.language }, result, answerMs, conversationId);
@@ -204,7 +249,7 @@ export async function runQuery(
       router: routerResult,
       decomposition: decomposeResult,
       iterations,
-      finalEvidenceCount: retrievedList.length,
+      finalEvidenceCount: selectedEvidence.length,
     };
     result.debug = queryDebug;
   }

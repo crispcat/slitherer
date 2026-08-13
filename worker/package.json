@@ -11,9 +11,7 @@
     "typecheck": "npm run gen-config && tsc --noEmit",
     "ingest": "node scripts/ingest.mjs",
     "clear": "node scripts/clear.mjs",
-    "tree": "xdg-open https://debug.slitherer.workers.dev",
-    "deploy:client": "wrangler pages deploy ../pages/client --project-name slitherer-rag --commit-dirty=true --branch main",
-    "deploy:debug": "wrangler pages deploy ../pages/debug --project-name slitherer-debug --commit-dirty=true --branch main"
+    "tree": "xdg-open https://debug.slitherer.workers.dev"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250101.0",

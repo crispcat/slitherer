@@ -6,29 +6,36 @@ import {
   createIngestionJob,
   getIngestionJob,
   getUnitsByStatus,
-  insertRelation,
+  getUnitsByStatusAndPages,
   logDebug,
   updateIngestionJob,
   upsertDocument,
   upsertSemanticUnit,
 } from "../utils/db";
 import { generateSummary } from "./summary";
-import { extractMetadata } from "./metadata";
-import { extractRelationships } from "./relationships";
-import { embedUnits, upsertEmbeddings } from "./embeddings";
-import { populateRelations } from "./graph";
+import { extractMetadata, computeMetadataTermsText, computeAliasesText, computeSectionPathText } from "./metadata";
+import {
+  buildSubjectDocument,
+  buildContentDocument,
+  embedSubjectUnits,
+  embedContentUnits,
+  upsertSubjectEmbeddings,
+  upsertContentEmbeddings,
+} from "./embeddings";
+import { extractConceptsForUnit, storeConceptResults, clearConceptMentionsForUnit } from "./concepts";
 import { extractPage } from "./vision_extract";
 import { normalizeUnits } from "./vision_verify";
+import { getSemanticUnit } from "../utils/db";
 import { INGESTION } from "../config.gen";
 
-export type IngestPhase = "vision" | "summary" | "metadata" | "relations" | "done";
+export type IngestPhase = "vision" | "summary" | "metadata" | "embedding" | "concepts" | "done";
 
 /** All valid stages that can be targeted with --stage. */
-export const INGEST_STAGES = ["vision", "summary", "metadata", "relations"] as const;
+export const INGEST_STAGES = ["vision", "summary", "metadata", "embedding", "concepts"] as const;
 export type IngestStage = (typeof INGEST_STAGES)[number];
 
 /** Order of phases — used to skip ahead when a target stage is requested. */
-const PHASE_ORDER: IngestPhase[] = ["vision", "summary", "metadata", "relations", "done"];
+const PHASE_ORDER: IngestPhase[] = ["vision", "summary", "metadata", "embedding", "concepts", "done"];
 
 export interface IngestJobDetail {
   documentId: string;
@@ -149,7 +156,11 @@ export async function processVisionPage(
   const oldToNewId = new Map<string, string>();
   for (let i = 0; i < normalized.length; i++) {
     const oldId = normalized[i].id;
-    const prefix = normalized[i].type === "Table" ? "TABLE" : "RULE";
+    const type = normalized[i].type;
+    // Determine ID prefix based on unit type
+    let prefix = "RULE";
+    if (type === "Image") prefix = "IMG";
+    else if (type === "DataTableHeader" || type === "DataTableRow" || type === "ColumnListTable" || type === "ColumnListItem") prefix = "TABLE";
     const newId = `${prefix}-${(await sha256(`${documentId}:${pageNumber}:${i}`)).slice(0, 32)}`;
     oldToNewId.set(oldId, newId);
     normalized[i].id = newId;
@@ -162,15 +173,15 @@ export async function processVisionPage(
   }
 
   // 4. Store units in D1
-  // First, clean up any existing relations for units on this page (in case of
+  // Clean up any existing concept mentions for units on this page (in case of
   // Queue redelivery — deterministic IDs mean the units themselves will be
-  // upserted, but old relations referencing these IDs need to be cleared).
+  // upserted, but old concept mentions referencing these IDs need to be cleared).
   const unitIds = normalized.map((u) => u.id);
   if (unitIds.length > 0) {
     const placeholders = unitIds.map(() => "?").join(",");
     await env.DB.prepare(
-      `DELETE FROM relations WHERE source_id IN (${placeholders}) OR target_id IN (${placeholders})`
-    ).bind(...unitIds, ...unitIds).run();
+      `DELETE FROM concept_mentions WHERE unit_id IN (${placeholders})`
+    ).bind(...unitIds).run();
   }
 
   const now = new Date().toISOString();
@@ -189,6 +200,7 @@ export async function processVisionPage(
       section: unit.section,
       content: unit.content,
       contentHash,
+      sectionPathText: computeSectionPathText(unit.section),
       status: "pending",
       updatedAt: now,
     };
@@ -230,39 +242,44 @@ export async function processVisionPage(
 }
 
 /**
- * Advances an ingestion job by one batch for the summary/metadata/relations phases.
+ * Advances an ingestion job by one batch for the summary/metadata/embedding/concepts phases.
  * The vision phase is handled by the Queue (processVisionPage), not here.
  *
  * Call repeatedly (e.g. from a client poll loop) until job.status === "done".
  *
- * The pipeline runs as four sequential, whole-document phases:
+ * The pipeline runs as five sequential, whole-document phases:
  *   1. vision    — Queue-based: each page is processed by processVisionPage.
- *   2. summary   — Generate summary + embed using summary, for every unit.
+ *   2. summary   — Generate summary for every unit (no embedding yet).
  *      Uses parent name and children names as context (not parent summaries),
- *      so no parent-first ordering needed. Embeddings upserted to Vectorize.
- *   3. metadata  — Phase 4 metadata extraction, for every unit.
- *   4. relations — Phase 5 + graph relations (Phase 7), for every unit.
+ *      so no parent-first ordering needed.
+ *   3. metadata  — Metadata + aliases extraction, for every unit.
+ *   4. embedding — Subject + content embeddings, upserted to two Vectorize indexes.
+ *   5. concepts  — Concept extraction, resolution, and embedding, for every unit.
  */
 export async function processIngestionBatch(
   env: Env,
   jobId: string,
   batchSize = INGESTION.ingestion.batchSizes.summary.value,
   targetStage?: IngestStage,
+  pages?: number[] | null,
 ) {
   const job = await getIngestionJob(env, jobId);
   if (!job) throw new Error(`Unknown ingestion job ${jobId}`);
-  if ((job as any).status === "done") return { done: true, phase: "done", progress: 1 };
+  // Allow targetStage to override a "done" job — resetIngestionStage should
+  // have already set status to "running", but this is a safety net.
+  if ((job as any).status === "done" && !targetStage) {
+    return { done: true, phase: "done", progress: 1 };
+  }
 
   const detail: IngestJobDetail = JSON.parse((job as any).detail);
+  const hasPageScope = pages && pages.length > 0;
 
-  // If a target stage is specified, skip ahead to it by advancing the phase.
-  if (targetStage) {
-    const currentIdx = PHASE_ORDER.indexOf(detail.phase);
-    const targetIdx = PHASE_ORDER.indexOf(targetStage);
-    if (targetIdx > currentIdx) {
-      detail.phase = targetStage;
-      await updateIngestionJob(env, jobId, detail.phase, "running", JSON.stringify(detail));
-    }
+  // If a target stage is specified, set the phase to it. This handles both
+  // skip-ahead (jumping forward to a later stage) and re-running an earlier
+  // stage after resetIngestionStage reset the job.
+  if (targetStage && detail.phase !== targetStage) {
+    detail.phase = targetStage;
+    await updateIngestionJob(env, jobId, detail.phase, "running", JSON.stringify(detail));
   }
 
   switch (detail.phase) {
@@ -271,28 +288,57 @@ export async function processIngestionBatch(
       // Return current progress so the client can poll.
       break;
     case "summary":
-      await stepSummaryPhase(env, detail, batchSize);
+      await stepSummaryPhase(env, detail, batchSize, pages);
       break;
     case "metadata":
-      await stepMetadataPhase(env, detail, batchSize);
+      await stepMetadataPhase(env, detail, batchSize, pages);
       break;
-    case "relations":
-      await stepRelationsPhase(env, detail, batchSize);
+    case "embedding":
+      await stepEmbeddingPhase(env, detail, batchSize, pages);
+      break;
+    case "concepts":
+      await stepConceptsPhase(env, detail, batchSize, pages);
       break;
   }
 
-  const done = detail.phase === "done";
-  const stageDone = targetStage && detail.phase !== targetStage && detail.phase !== "done"
-    ? true
+  // For page-scoped runs, "done" means no more units in scope for the current phase.
+  // For document-wide runs, "done" means the phase advanced to "done".
+  let done: boolean;
+  let remaining: number;
+  if (hasPageScope) {
+    // Count units in scope that still need processing for the current phase
+    const statusVal = statusForPhase(detail.phase);
+    if (detail.phase === "done") {
+      done = true;
+      remaining = 0;
+    } else if (detail.phase === "vision") {
+      done = false; // vision is Queue-driven, polling handles completion
+      remaining = detail.totalPages - detail.pagesProcessed;
+    } else {
+      // Check if there are any units in scope with the expected status
+      const { getUnitsByStatusAndPages } = await import("../utils/db");
+      const inScope = await getUnitsByStatusAndPages(env, statusVal, 1, pages!);
+      done = inScope.length === 0;
+      remaining = inScope.length;
+    }
+  } else {
+    done = detail.phase === "done";
+    remaining = done
+      ? 0
+      : detail.phase === "vision"
+        ? detail.totalPages - detail.pagesProcessed
+        : await countUnitsByStatus(env, statusForPhase(detail.phase));
+  }
+
+  // For page-scoped target stage runs, stageDone when no more in-scope units
+  const stageDone = targetStage
+    ? (hasPageScope ? done : (detail.phase !== targetStage && detail.phase !== "done" ? true : done))
     : done;
 
-  await updateIngestionJob(env, jobId, detail.phase, done ? "done" : "running", JSON.stringify(detail));
-
-  const remaining = done
-    ? 0
-    : detail.phase === "vision"
-      ? detail.totalPages - detail.pagesProcessed
-      : await countUnitsByStatus(env, statusForPhase(detail.phase));
+  // Only mark the job as "done" for document-wide runs that completed fully.
+  // Page-scoped runs should not mark the whole job as done.
+  const jobStatus = (!hasPageScope && done) ? "done" : "running";
+  await updateIngestionJob(env, jobId, detail.phase, jobStatus, JSON.stringify(detail));
 
   await logDebug(env, "info", `ingestion:${detail.phase}`, `Batch complete`, {
     jobId,
@@ -300,6 +346,7 @@ export async function processIngestionBatch(
     unitsProcessed: detail.unitsProcessed,
     remaining,
     done: stageDone || done,
+    pages: hasPageScope ? pages : undefined,
   });
 
   return {
@@ -318,101 +365,185 @@ function statusForPhase(phase: IngestPhase): string {
       return "pending";
     case "metadata":
       return "summary_done";
-    case "relations":
+    case "embedding":
       return "metadata_done";
+    case "concepts":
+      return "embedding_done";
     default:
       return "pending";
   }
 }
 
-async function stepSummaryPhase(env: Env, detail: IngestJobDetail, batchSize: number) {
+async function stepSummaryPhase(env: Env, detail: IngestJobDetail, batchSize: number, pages?: number[] | null) {
   const summaryBatchSize = Math.min(batchSize, INGESTION.ingestion.batchSizes.summary.value);
-  const batch = await getUnitsByStatus(env, "pending", summaryBatchSize);
+  const batch = await getUnitsByStatusAndPages(env, "pending", summaryBatchSize, pages ?? null);
   for (const unit of batch) {
     unit.summary = await generateSummary(env, unit);
     unit.status = "summary_done";
     unit.updatedAt = new Date().toISOString();
-    // Embed using the generated summary and upsert to Vectorize immediately.
-    const vectors = await embedUnits(env, [unit]);
-    await upsertEmbeddings(env, [unit], vectors);
+    // No embedding here — embeddings are generated in the embedding phase after metadata
     await upsertSemanticUnit(env, unit);
   }
-  if (batch.length === 0) {
+  if (batch.length === 0 && !pages) {
     detail.phase = "metadata";
     await logDebug(env, "info", "ingestion:summary", `Summary phase complete — transitioning to metadata`);
   }
 }
 
-async function stepMetadataPhase(env: Env, detail: IngestJobDetail, batchSize: number) {
+async function stepMetadataPhase(env: Env, detail: IngestJobDetail, batchSize: number, pages?: number[] | null) {
   const metadataBatchSize = Math.min(batchSize, INGESTION.ingestion.batchSizes.metadata.value);
-  const batch = await getUnitsByStatus(env, "summary_done", metadataBatchSize);
+  const batch = await getUnitsByStatusAndPages(env, "summary_done", metadataBatchSize, pages ?? null);
   for (const unit of batch) {
-    const metadata = await extractMetadata(env, unit);
+    const metadata = await extractMetadataWithRetry(env, unit);
     unit.metadata = metadata;
+    // Compute FTS5 text fields from metadata + section
+    unit.metadataTermsText = computeMetadataTermsText(metadata);
+    unit.aliasesText = computeAliasesText(metadata);
+    unit.sectionPathText = computeSectionPathText(unit.section);
     unit.status = "metadata_done";
     unit.updatedAt = new Date().toISOString();
     await upsertSemanticUnit(env, unit);
   }
-  if (batch.length === 0) {
-    detail.phase = "relations";
-    await logDebug(env, "info", "ingestion:metadata", `Metadata phase complete — transitioning to relations`);
+  if (batch.length === 0 && !pages) {
+    detail.phase = "embedding";
+    await logDebug(env, "info", "ingestion:metadata", `Metadata phase complete — transitioning to embedding`);
   }
 }
 
-async function stepRelationsPhase(env: Env, detail: IngestJobDetail, batchSize: number) {
-  const relationsBatchSize = Math.min(batchSize, INGESTION.ingestion.batchSizes.relations.value);
-  const batch = await getUnitsByStatus(env, "metadata_done", relationsBatchSize);
-  for (const unit of batch) {
-    const relations = await extractRelationships(env, unit);
-    await populateRelations(env, unit, relations);
-
-    // Deterministic parent_of/child_of relations from the unit hierarchy
-    if (unit.parentUnitId) {
-      await insertRelation(env, {
-        id: nextId("REL"),
-        source: unit.parentUnitId,
-        target: unit.id,
-        relation_type: "parent_of",
-        confidence: 1.0,
+/** Extract metadata with retry logic. Metadata extraction is a critical step —
+ *  aliases and metadata fields feed into both the embedding text and the FTS5 index.
+ *  If all retries fail, the error is thrown and the pipeline halts for this unit. */
+async function extractMetadataWithRetry(env: Env, unit: SemanticUnit): Promise<import("../types").UnitMetadata> {
+  const maxRetries = INGESTION.llm.defaultMaxRetries.value;
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await extractMetadata(env, unit);
+    } catch (err) {
+      lastErr = err;
+      await logDebug(env, "warn", "ingestion:metadata", `Metadata extraction failed (attempt ${attempt + 1}/${maxRetries + 1})`, {
+        unitId: unit.id,
+        error: String(err),
       });
-      await insertRelation(env, {
-        id: nextId("REL"),
-        source: unit.id,
-        target: unit.parentUnitId,
-        relation_type: "child_of",
-        confidence: 1.0,
-      });
+      if (attempt < maxRetries) {
+        // Exponential backoff: 1s, 2s, 4s...
+        await new Promise((resolve) => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
+      }
     }
+  }
+  await logDebug(env, "error", "ingestion:metadata", `Metadata extraction failed after ${maxRetries + 1} attempts — halting pipeline for unit`, {
+    unitId: unit.id,
+    error: String(lastErr),
+  });
+  throw new Error(`Metadata extraction failed for unit ${unit.id} after ${maxRetries + 1} attempts: ${String(lastErr)}`);
+}
 
-    unit.status = "relations_done";
+/** Collect parent names by walking parentUnitId up to the root. */
+async function collectParentNames(env: Env, unit: SemanticUnit): Promise<string[]> {
+  const names: string[] = [];
+  let currentId = unit.parentUnitId;
+  const visited = new Set<string>(); // guard against cycles
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId);
+    const parent = await getSemanticUnit(env, currentId);
+    if (!parent) break;
+    if (parent.name) names.unshift(parent.name);
+    currentId = parent.parentUnitId;
+  }
+  return names;
+}
+
+/** Get the document name for a unit's document. */
+async function getDocumentName(env: Env, documentId: string | undefined): Promise<string> {
+  if (!documentId) return "";
+  const row = await env.DB.prepare(`SELECT source_path FROM documents WHERE id = ?`).bind(documentId).first();
+  if (!row) return "";
+  const path = row.source_path as string;
+  // Extract filename without extension
+  const filename = path.split("/").pop() ?? path;
+  return filename.replace(/\.[^.]+$/, "");
+}
+
+async function stepEmbeddingPhase(env: Env, detail: IngestJobDetail, batchSize: number, pages?: number[] | null) {
+  const embeddingBatchSize = Math.min(batchSize, INGESTION.ingestion.batchSizes.embedding.value);
+  const batch = await getUnitsByStatusAndPages(env, "metadata_done", embeddingBatchSize, pages ?? null);
+  if (batch.length === 0 && !pages) {
+    detail.phase = "concepts";
+    await logDebug(env, "info", "ingestion:embedding", `Embedding phase complete — transitioning to concepts`);
+    return;
+  }
+
+  // Get document name once for the whole batch
+  const documentName = await getDocumentName(env, batch[0].documentId);
+
+  // Collect parent names for each unit (needed for the Path field in embeddings)
+  const parentNamesMap = new Map<string, string[]>();
+  for (const unit of batch) {
+    const parentNames = await collectParentNames(env, unit);
+    parentNamesMap.set(unit.id, parentNames);
+  }
+
+  // Build subject documents and embed
+  const subjectDocs = batch.map((u) => buildSubjectDocument(u, documentName, parentNamesMap.get(u.id) ?? []));
+  const subjectVectors = await embedSubjectUnits(env, batch, subjectDocs);
+  await upsertSubjectEmbeddings(env, batch, subjectVectors);
+
+  // Build content documents and embed
+  const contentDocs = batch.map((u) => buildContentDocument(u, documentName, parentNamesMap.get(u.id) ?? []));
+  const contentVectors = await embedContentUnits(env, batch, contentDocs);
+  await upsertContentEmbeddings(env, batch, contentVectors);
+
+  // Update unit status and embedding IDs
+  const now = new Date().toISOString();
+  for (const unit of batch) {
+    unit.subjectEmbeddingId = unit.id;
+    unit.contentEmbeddingId = unit.id;
+    unit.status = "embedding_done";
+    unit.updatedAt = now;
+    await upsertSemanticUnit(env, unit);
+  }
+}
+
+async function stepConceptsPhase(env: Env, detail: IngestJobDetail, batchSize: number, pages?: number[] | null) {
+  const conceptsBatchSize = Math.min(batchSize, INGESTION.ingestion.batchSizes.concepts.value);
+  const batch = await getUnitsByStatusAndPages(env, "embedding_done", conceptsBatchSize, pages ?? null);
+  for (const unit of batch) {
+    // Clear old mentions for this unit before re-extracting
+    await clearConceptMentionsForUnit(env, unit.id);
+
+    const result = await extractConceptsForUnit(env, unit, unit.documentId ?? "doc1");
+    await storeConceptResults(env, result);
+
+    unit.status = "done";
     unit.updatedAt = new Date().toISOString();
     await upsertSemanticUnit(env, unit);
   }
-  if (batch.length === 0) {
+  if (batch.length === 0 && !pages) {
     detail.phase = "done";
-    await logDebug(env, "info", "ingestion:relations", `Relations phase complete — ingestion done`, {
+    await logDebug(env, "info", "ingestion:concepts", `Concepts phase complete — ingestion done`, {
       totalUnits: detail.unitsProcessed,
     });
   }
 }
 
 /**
- * Second pass over Phase 5 across the whole knowledge base.
- * Rebuilds all relationships using vector-search-based extraction.
+ * Second pass over the whole knowledge base.
+ * Rebuilds all concepts using the concept extraction pipeline.
  */
-export async function rebuildAllRelationships(env: Env, batchSize: number, cursor: number) {
+export async function rebuildAllConcepts(env: Env, batchSize: number, cursor: number) {
   const { getAllUnits } = await import("../utils/db");
   const allUnits = await getAllUnits(env);
   const batch = allUnits.slice(cursor, cursor + batchSize);
   let processed = 0;
   for (const unit of batch) {
-    const relations = await extractRelationships(env, unit);
-    await populateRelations(env, unit, relations);
+    await clearConceptMentionsForUnit(env, unit.id);
+    const result = await extractConceptsForUnit(env, unit, unit.documentId ?? "doc1");
+    await storeConceptResults(env, result);
     processed++;
   }
   const nextCursor = cursor + batch.length;
   const done = nextCursor >= allUnits.length;
-  await logDebug(env, "info", "ingestion:relations", `Rebuild batch complete`, {
+  await logDebug(env, "info", "ingestion:concepts", `Rebuild batch complete`, {
     cursor,
     processed,
     nextCursor,

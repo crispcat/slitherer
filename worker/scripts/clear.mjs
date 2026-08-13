@@ -2,7 +2,8 @@
 /**
  * Clear all ingestion data — local state + remote DB, Vectorize, and R2.
  * Does NOT parse the document or redeploy the worker.
- * Does NOT clear client logs (conversations, query_logs, debug_logs).
+ * Does NOT clear client/pipeline logs (conversations, query_logs, debug_logs,
+ * candidate_logs).
  *
  * Usage:
  *   npm run clear
@@ -73,8 +74,10 @@ console.log(cleanupResp.trim());
 // ---- 3/3: Summary ----
 step(3, 3, "Clear complete");
 console.log(`Document: ${DOCUMENT_ID}`);
-console.log("Cleared: local state, D1 tables, Vectorize vectors, R2 job/structure files");
+console.log("Cleared: local state, D1 tables (units, concepts, mentions, aliases, jobs),");
+console.log("         Vectorize vectors (subjects + content + concepts),");
+console.log("         R2 legacy structure/job files (if any)");
 console.log("Preserved: R2 page images (reused on next ingest)");
-console.log("Preserved: conversations, query_logs, debug_logs (client/pipeline logs)");
+console.log("Preserved: conversations, query_logs, debug_logs, candidate_logs (client/pipeline logs)");
 
 console.log("\n=== Done ===");

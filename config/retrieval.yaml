@@ -1,55 +1,7 @@
 # Retrieval pipeline configuration.
-# All prompts, thresholds, models, and mode switches for the agentic retrieval
+# All prompts, thresholds, and mode switches for the agentic retrieval
 # pipeline (router → decompose → retrieve → sufficiency loop → answer).
-
-models:
-  router:
-    binding: EXTRACTION_MODEL
-    default: "@cf/zai-org/glm-4.7-flash"
-    description: >-
-      Used for Step 1 router (RAG/chat classification + language detection +
-      translation) and chat responses. Multilingual (100+ langs), FC,
-      latency-optimized — best for translation quality and fast response.
-    file: retrieval/router.ts
-
-  decompose:
-    binding: REASONING_MODEL
-    default: "@cf/qwen/qwen3-30b-a3b-fp8"
-    description: >-
-      Used for Step 2 query decomposition into sub-queries + dynamic rerank threshold.
-      30B MoE (3B active) with reasoning — fast (latency-critical), understands
-      query intent, excellent Russian.
-    file: retrieval/decompose.ts
-
-  sufficiency:
-    binding: REASONING_MODEL
-    default: "@cf/qwen/qwen3-30b-a3b-fp8"
-    description: >-
-      Used for Step 5 sufficiency check + follow-up query generation. Extremely
-      input-heavy (20-50:1 I/O ratio) — qwen3's cheap input ($0.051/M) is the
-      decisive factor. Reasoning capability handles coverage/interaction evaluation.
-    file: retrieval/sufficiency.ts
-
-  answer:
-    binding: ANSWER_MODEL
-    default: "@cf/openai/gpt-oss-120b"
-    description: >-
-      Used for Step 6 answer generation with citations. User-facing output —
-      uses the strongest model (120B reasoning). Output is 3x cheaper than 70b,
-      strong multilingual for answer generation in user's language.
-    file: retrieval/answer.ts
-
-  embedding:
-    binding: EMBEDDING_MODEL
-    default: "@cf/baai/bge-m3"
-    description: Used for query embedding in Step 3 vector search (1024-dim)
-    file: retrieval/query.ts
-
-  rerank:
-    binding: RERANK_MODEL
-    default: "@cf/baai/bge-reranker-base"
-    description: Used for per-sub-query reranking in Step 4
-    file: retrieval/query.ts
+# Model bindings are configured in worker/wrangler.toml (not here).
 
 pipeline:
   historyTurns:
@@ -62,15 +14,15 @@ pipeline:
   maxIterations:
     value: 3
     description: >-
-      Maximum retrieval iterations (initial + 2 follow-ups).
-      Configurable via API parameter.
+      Maximum retrieval iterations for simple queries (initial + 1 follow-up).
+      Phase 9: Complex queries use maxComplexIterations instead.
     file: retrieval/pipeline.ts
 
-  graphHops:
-    value: 2
+  maxComplexIterations:
+    value: 5
     description: >-
-      Default graph expansion hops. Configurable via API parameter
-      (labeled 'Semantical Net Width' in UI).
+      Phase 9: Maximum retrieval iterations for complex queries (e.g. character creation).
+      Complex queries use iterative retrieval as the primary gathering mechanism.
     file: retrieval/pipeline.ts
 
   streamingChunkSize:
@@ -80,37 +32,127 @@ pipeline:
       support true token streaming)
     file: retrieval/pipeline.ts, retrieval/answer.ts
 
-  logTruncateLength:
-    value: 80
-    description: Character length for truncating question/query in console.log output
-    file: retrieval/pipeline.ts
-
 retrieval:
-  similarityThreshold:
-    value: 0.5
-    description: Minimum vector similarity for a match to be kept after vector search
+  subjectTopK:
+    value: 15
+    description: >-
+      Phase 4: Top-K results from subject Vectorize search per subquery.
+      Subject embeddings capture "what is this unit about" — good for semantic discovery.
     file: retrieval/query.ts
 
-  relationConfidenceThreshold:
-    value: 0.5
+  contentTopK:
+    value: 15
     description: >-
-      Minimum relation confidence for graph expansion — relations below this
-      are not followed
+      Phase 4: Top-K results from content Vectorize search per subquery.
+      Content embeddings capture exact rule text — good for precise retrieval.
     file: retrieval/query.ts
 
-  vectorCandidatePool:
-    value: 100
+  lexicalTopK:
+    value: 15
     description: >-
-      Candidate pool per sub-query for vector search (topK).
-      Cast a wide net, filter by similarity threshold.
+      Phase 4: Top-K results from FTS5 lexical search per subquery.
+      Lexical search catches exact term matches that vector search may miss.
     file: retrieval/query.ts
 
-  defaultRerankThreshold:
-    value: 0.3
+  rrfK:
+    value: 60
     description: >-
-      Default rerank threshold if not provided by decomposer.
-      The decomposer normally sets this dynamically (0.2-0.5).
+      Phase 4: RRF (Reciprocal Rank Fusion) constant.
+      k=60 is the standard value — balances rank vs. score dominance.
     file: retrieval/query.ts
+
+  conceptExpansionTopK:
+    value: 5
+    description: >-
+      Phase 5: Max concepts to expand per subquery.
+      Each concept may bring multiple related units.
+    file: retrieval/query.ts
+
+  conceptUnitsPerConcept:
+    value: 3
+    description: >-
+      Phase 5: Max units to retrieve per expanded concept.
+    file: retrieval/query.ts
+
+  maxCandidates:
+    value: 50
+    description: >-
+      Phase 5: Total candidate cap after all expansion.
+      Prevents unbounded candidate pools from degrading reranking performance.
+    file: retrieval/query.ts
+
+ranking:
+  weightRerank:
+    value: 0.70
+    description: >-
+      Phase 6: Weight for max rerank score in the final ranking formula.
+      The dominant signal — reranker directly measures query-document relevance.
+    file: retrieval/query.ts
+
+  weightCoverage:
+    value: 0.15
+    description: >-
+      Phase 6: Weight for query coverage in the final ranking formula.
+      Rewards candidates found by multiple sub-queries.
+    file: retrieval/query.ts
+
+  weightDirectHit:
+    value: 0.10
+    description: >-
+      Phase 6: Weight for direct-hit status in the final ranking formula.
+      Rewards candidates found via direct retrieval (not expansion).
+    file: retrieval/query.ts
+
+  weightDiversity:
+    value: 0.05
+    description: >-
+      Phase 6: Weight for retrieval diversity in the final ranking formula.
+      Rewards candidates from diverse retrieval sources (subject + content + lexical).
+    file: retrieval/query.ts
+
+rerank:
+  threshold:
+    value: 0.4
+    description: >-
+      Phase 6: Server-controlled rerank threshold.
+      Candidates below this score are filtered out.
+      Replaces the decomposer-controlled threshold.
+    file: retrieval/query.ts
+
+  maxResults:
+    value: 12
+    description: >-
+      Phase 6: Maximum number of results after reranking.
+      Excess candidates are filtered out.
+    file: retrieval/query.ts
+
+  fallbackTopK:
+    value: 3
+    description: >-
+      Phase 6: If no candidates pass the rerank threshold, return the top-K
+      by rerank score as a fallback (prevents empty results).
+    file: retrieval/query.ts
+
+evidence:
+  budget:
+    value: 8
+    description: >-
+      Phase 7: Soft target for evidence units passed to the answer model.
+      Enough context for most queries without overwhelming the model.
+    file: retrieval/evidence.ts
+
+  maxBudget:
+    value: 10
+    description: >-
+      Phase 7: Hard cap for evidence units. No more than this is ever passed.
+    file: retrieval/evidence.ts
+
+  comparableScoreDelta:
+    value: 0.05
+    description: >-
+      Phase 7: When final scores differ by at most this amount, direct-hit
+      status is used as a tiebreaker (prefer direct retrieval over expansion).
+    file: retrieval/evidence.ts
 
 decomposition:
   maxSubQueries:
@@ -122,22 +164,6 @@ decomposition:
     value: 0.3
     description: Fallback rerank threshold if LLM returns invalid value
     file: retrieval/decompose.ts
-
-  rerankThresholdRanges:
-    precise:
-      min: 0.4
-      max: 0.5
-      description: Precise lookup questions (e.g. 'what is the DC for X?')
-
-    exploratory:
-      min: 0.2
-      max: 0.3
-      description: Exploratory questions (e.g. 'tell me about combat mechanics')
-
-    interaction:
-      min: 0.3
-      max: 0.4
-      description: Questions about interactions between mechanics
 
 sufficiency:
   maxFollowUpQueries:

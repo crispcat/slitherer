@@ -23,6 +23,130 @@
 
 ---
 
+## Implementation Status
+
+| Phase | Status | Summary |
+|-------|--------|---------|
+| Phase 1 — Fix Alias Timing + Redesign Embeddings | **Completed** | Subject + content embeddings, two Vectorize indexes, path-aware embedding docs, compact metadata, metadata retry, embedding phase, status flow |
+| Phase 2 — Build FTS5 Lexical Index | **Completed** | FTS5 external-content table, sync triggers, metadata_terms_text/section_path_text/aliases_text columns, lexical search helper |
+| Phase 3 — Remove Relations + Build Concept Layer + Table Unit Types | **Completed** | New table types (DataTableHeader/Row, ColumnListTable/Item), deterministic type checking, concept tables, concept extraction/resolution/embedding, concept Vectorize index, debug APIs |
+| Phase 4 — Hybrid Retrieval | **Completed** | Subject + content + FTS5 lexical search per subquery, RRF fusion (k=60), config-driven top-K |
+| Phase 5 — Redesign Candidate Expansion | **Completed** | Concept-first expansion, type-driven hierarchy expansion, structured provenance, candidate caps, graph expansion removed |
+| Phase 6 — Improve Reranking | **Completed** | Weighted ranking formula (rerank/coverage/directHit/diversity), server-controlled threshold (0.4), max results, fallback top-K |
+| Phase 7 — Evidence Selection + Context Reconstruction | **Completed** | Deterministic evidence selection (dedup, coverage, direct-hit tiebreak, complementary rules, budget), list-query no-cap, hierarchical context reconstruction |
+| Phase 8 — Preserve Original + Translated Queries | **Completed** | originalQuery preserved, entity extraction, decomposer receives both queries + entities |
+| Phase 9 — Improve Sufficiency Loop | **Completed** | Categorized gaps (9 types), simple/complex query modes, accumulated evidence, targeted follow-ups, separate iteration limits |
+| Phase 10 — Add Retrieval Diagnostics | **Completed** | candidate_logs table, per-stage candidate logging, evidence selection logging, debug API endpoints |
+| Phase 11 — Optimize After Correctness | **Not implemented (deferred)** | Explicitly deferred per user request |
+
+### What Was Implemented and How
+
+#### Phase 1 — Fix Alias Timing + Redesign Embeddings
+
+**Files modified:** `worker/src/types.ts`, `worker/schema.sql`, `worker/wrangler.toml`, `worker/src/pipeline/embeddings.ts`, `worker/src/utils/db.ts`, `worker/src/pipeline/ingest.ts`, `config/ingestion.yaml`, `worker/scripts/ingest.mjs`
+
+- **New Vectorize bindings:** Replaced single `VECTORIZE_INDEX` with `VECTORIZE_SUBJECTS` and `VECTORIZE_CONTENT`. Created both indexes on Cloudflare (1024-dim, cosine).
+- **New embedding functions:** `buildSubjectDocument()` (document name, path, name, summary, aliases — no content) and `buildContentDocument()` (same + full content, truncating only content if over budget). Path is built from section path + semantic tree path through all parents.
+- **Compact Vectorize metadata:** Single JSON blob under `meta` key with unit_id, document_id, type, name, section_path, parent_unit_id, page, source_order, content_hash.
+- **Pipeline reordering:** vision → summary → metadata → embedding → concepts → done. Summary phase no longer embeds. New `stepEmbeddingPhase()` runs after metadata.
+- **Status flow:** pending → summary_done → metadata_done → embedding_done → done.
+- **Metadata retry:** `extractMetadataWithRetry()` with exponential backoff. Failure throws and halts pipeline for the unit.
+- **Schema migration:** Added `subject_embedding_id` and `content_embedding_id` columns via ALTER TABLE on remote DB.
+
+#### Phase 2 — Build FTS5 Lexical Index
+
+**Files modified:** `worker/schema.sql`, `worker/src/types.ts`, `worker/src/utils/db.ts`, `worker/src/pipeline/metadata.ts`, `worker/src/pipeline/ingest.ts`
+
+- **FTS5 external-content table:** `semantic_unit_search` with columns: name, aliases_text, summary, content, section_path_text, metadata_terms_text. Uses `content='semantic_units'` and `content_rowid='rowid'`.
+- **Sync triggers:** AFTER INSERT, AFTER DELETE, AFTER UPDATE triggers keep FTS index synchronized with base table.
+- **New columns:** `metadata_terms_text` (all metadata arrays flattened), `section_path_text` (section joined with " > "), `aliases_text` (aliases joined with ", ").
+- **Metadata phase updates:** Computes FTS5 text fields after metadata extraction.
+- **Lexical search helper:** `lexicalSearch()` in `query.ts` uses FTS5 BM25 ranking via `bm25()` function.
+
+#### Phase 3 — Remove Relations + Build Concept Layer + Table Unit Types
+
+**Files modified:** `worker/src/types.ts`, `worker/schema.sql`, `worker/wrangler.toml`, `worker/src/pipeline/vision_verify.ts`, `worker/src/pipeline/concepts.ts` (new), `worker/src/pipeline/ingest.ts`, `worker/src/utils/db.ts`, `worker/src/index.ts`, `config/ingestion.yaml`, `worker/scripts/ingest.mjs`
+
+- **New unit types:** Added `DataTableHeader`, `DataTableRow`, `ColumnListTable`, `ColumnListItem` to `SEMANTIC_UNIT_TYPES`. Old `Table` kept for backward compat.
+- **Deterministic type checking:** Two-pass parent-precedence rules in `vision_verify.ts`. Pass 1: parent controls children. Pass 2: child promotes non-table parent.
+- **Concept tables:** `concepts`, `concept_aliases`, `concept_mentions` with proper indexes and foreign keys.
+- **Concept pipeline (`concepts.ts`):** Extracts raw mentions from metadata fields, normalizes terms, resolves via exact alias → normalized alias → concept vector search → LLM validation → create new. Generates concept types and descriptions via LLM. Embeds concepts to `VECTORIZE_CONCEPTS_IDX`.
+- **Reactive aliases:** New aliases accumulate when vector-matched mentions resolve to existing concepts.
+- **Concepts phase:** Replaced relations phase with `stepConceptsPhase()`. `rebuildAllConcepts()` replaces `rebuildAllRelationships()`.
+- **Debug APIs:** `/debug/concepts` (list all), `/debug/concepts/:id` (detail with aliases + mentions). `getUnitDetails()` now returns concept mentions.
+- **Vision prompt updated:** 6 unit types with detailed descriptions for DataTableHeader/Row, ColumnListTable/Item.
+
+#### Phase 4 — Hybrid Retrieval
+
+**Files modified:** `worker/src/retrieval/query.ts`, `config/retrieval.yaml`, `worker/src/retrieval/pipeline.ts`, `worker/src/index.ts`
+
+- **Three-way search per subquery:** Subject Vectorize (topK=15), Content Vectorize (topK=15), FTS5 lexical (topK=15).
+- **RRF fusion:** Reciprocal Rank Fusion with k=60 combines all three ranked lists into a single discovery ranking.
+- **Config-driven:** `subjectTopK`, `contentTopK`, `lexicalTopK`, `rrfK` in `config/retrieval.yaml`.
+- **Graph expansion removed:** No more `graphHops` parameter or graph traversal.
+
+#### Phase 5 — Redesign Candidate Expansion
+
+**Files modified:** `worker/src/retrieval/query.ts`, `config/retrieval.yaml`
+
+- **Concept expansion (first):** `expandConcepts()` finds related units via concept mentions. Runs before hierarchy expansion to avoid starvation.
+- **Type-driven hierarchy expansion (second):** `expandHierarchy()` applies the type-based rules: DataTableHeader → parent + all children; DataTableRow → parent + all siblings; ColumnListTable → parent + all children; ColumnListItem → parent + all children; Rule/Image → no expansion.
+- **Structured provenance:** `CandidateProvenance` interface with sources array tracking type (vector_subject/vector_content/lexical/parent/sibling/child/concept), rank, score, subQueryIndex, parentUnitId, conceptId.
+- **Candidate caps:** `conceptExpansionTopK=5`, `conceptUnitsPerConcept=3`, `maxCandidates=50`.
+
+#### Phase 6 — Improve Reranking
+
+**Files modified:** `worker/src/retrieval/query.ts`, `config/retrieval.yaml`
+
+- **Weighted ranking formula:** `final_score = 0.70×max_rerank + 0.15×coverage + 0.10×directHit + 0.05×diversity`.
+- **Server-controlled threshold:** `rerank.threshold=0.4` replaces decomposer-controlled threshold. Decomposer threshold is now ignored.
+- **Max results:** `rerank.maxResults=12` caps the final candidate list.
+- **Fallback:** If no candidates pass threshold, returns top-3 by rerank score.
+- **Configurable weights:** `ranking.weightRerank`, `weightCoverage`, `weightDirectHit`, `weightDiversity` in config.
+
+#### Phase 7 — Evidence Selection + Context Reconstruction
+
+**Files modified:** `worker/src/retrieval/evidence.ts` (new), `worker/src/retrieval/pipeline.ts`, `worker/src/types.ts`, `worker/src/retrieval/decompose.ts`, `config/retrieval.yaml`
+
+- **Deterministic evidence selection (`evidence.ts`):** 6 rules: sort by final_score, remove near-duplicates (content hash + hierarchy overlap), guarantee subquery coverage, prefer direct retrieval (within comparableScoreDelta=0.05), preserve complementary rules (from metadata requires/exceptions/modifies/modified_by), enforce budget (soft=8, hard=10).
+- **List-query no-cap:** `isListQuery` flag from decomposer skips the budget cap — all threshold-passing candidates included.
+- **Hierarchical context reconstruction:** `reconstructParentChain()` walks parentUnitId to root, collecting parent names. `buildEvidenceContext()` formats evidence with path, type, summary, content.
+- **Decomposer updates:** Added `isListQuery` and `queryComplexity` to schema and output.
+
+#### Phase 8 — Preserve Original + Translated Queries
+
+**Files modified:** `worker/src/types.ts`, `worker/src/retrieval/router.ts`, `worker/src/retrieval/decompose.ts`, `worker/src/retrieval/pipeline.ts`, `worker/src/index.ts`
+
+- **originalQuery preserved:** `RouterResult` now includes `originalQuery` (the user's raw input).
+- **Entity extraction:** Router extracts entities (proper nouns, abbreviations, numbers, dice notation, item names, acronyms, game terminology) and passes them to the decomposer.
+- **Decomposer receives both:** `decompose()` now accepts `originalQuery` and `entities` parameters, includes them in the LLM prompt for context.
+- **Step-by-step API:** `/query/decompose` endpoint accepts `originalQuery` and `entities`.
+
+#### Phase 9 — Improve Sufficiency Loop
+
+**Files modified:** `worker/src/types.ts`, `worker/src/retrieval/sufficiency.ts`, `worker/src/retrieval/pipeline.ts`, `config/retrieval.yaml`
+
+- **Categorized gaps:** 9 gap types: missing_exception, missing_prerequisite, missing_interaction, missing_table_dimension, missing_definition, contradictory_evidence, missing_step, missing_dependency, missing_category_member.
+- **Simple/complex query modes:** `queryComplexity` from decomposer. Simple: max 2 iterations. Complex: max 5 iterations.
+- **Evidence accumulation:** Evidence is accumulated across iterations (already existed in the merge logic, now explicitly documented).
+- **Targeted follow-ups:** Each categorized gap can have its own `followUpQuery`, which are used when the sufficiency check identifies specific gaps.
+- **Config:** `pipeline.maxIterations=3` (simple), `pipeline.maxComplexIterations=5` (complex).
+
+#### Phase 10 — Add Retrieval Diagnostics
+
+**Files modified:** `worker/schema.sql`, `worker/src/utils/db.ts`, `worker/src/index.ts`, `worker/src/retrieval/pipeline.ts`
+
+- **candidate_logs table:** Records per-stage candidate data: conversation_id, query_text, iteration, stage, unit_id, unit_name, unit_type, vector_score, rerank_score, final_score, provenance (JSON), selected flag.
+- **Logging in pipeline:** Candidates logged after rerank stage. Evidence selection logged with `selected=1`.
+- **Debug API endpoints:** `GET /debug/candidates?query=<text>` returns candidate logs for a query. `DELETE /debug/candidates` clears logs.
+- **D1 functions:** `logCandidate()`, `getCandidateLogs()`, `clearCandidateLogs()`.
+
+#### Phase 11 — Optimize After Correctness
+
+**Not implemented (deferred).** Per user request, optimization work (caching, batching, performance tuning) is deferred until correctness is validated.
+
+---
+
 # Part I — Ingestion Consolidation
 
 ---
@@ -181,7 +305,7 @@ Add a new D1 column on `semantic_units`:
 ALTER TABLE semantic_units ADD COLUMN metadata_terms_text TEXT;
 ```
 
-Computed during the metadata phase by flattening all metadata arrays (defines, references, requires, exceptions, modifies, modified_by, overrides, related_to, incompatible_with, creates, consumes, supersedes, example_of, part_of) into a single space-joined text string.
+Computed during the metadata phase by flattening all metadata arrays (defines, mentions) into a single space-joined text string.
 
 **Files to modify:**
 - `worker/schema.sql` — add `metadata_terms_text` column to `semantic_units`
@@ -304,7 +428,7 @@ Recommended: add `aliases_text TEXT` column, computed during the metadata phase,
 - `worker/src/pipeline/relationships.ts`: for each metadata term, embeds the bare term, queries Vectorize, takes top-K matches. Confidence = cosine similarity. No LLM validation.
 - `relations` table schema: `id, source_id, target_id, relation_type, confidence`
 - `Relation` type in `types.ts`: `id, source, target, relation_type, confidence`
-- Relation types: defines, references, requires, excepts, modifies, modified_by, overrides, related_to, incompatible_with, creates, consumes, supersedes, example_of, part_of, parent_of, child_of
+- Relation types: defines, references, requires, excepts, modifies, modified_by, overrides, related_to, incompatible_with, creates, consumes, supersedes, example_of, part_of, parent_of, child_of (all removed — replaced by concept mentions with types `defines` and `mentions`)
 - No concept tables exist in D1
 - No concept extraction in the ingestion pipeline
 - Current unit types: `Rule`, `Table`, `Image` (in `SEMANTIC_UNIT_TYPES` in `types.ts`)
@@ -403,7 +527,6 @@ CREATE TABLE IF NOT EXISTS concepts (
   document_id TEXT NOT NULL,
   canonical_name TEXT NOT NULL,
   description TEXT,
-  type TEXT NOT NULL,           -- mechanic, condition, attribute, resource, action, effect, item, characteristic, other
   embedding_id TEXT,
   source_unit_ids TEXT,         -- JSON array of unit IDs used to generate the description
   created_at TEXT NOT NULL,
@@ -428,7 +551,7 @@ CREATE TABLE IF NOT EXISTS concept_mentions (
   unit_id TEXT NOT NULL,
   raw_term TEXT NOT NULL,
   normalized_term TEXT NOT NULL,
-  mention_type TEXT NOT NULL,   -- defines, references, requires, exception, modifies, etc.
+  mention_type TEXT NOT NULL,   -- defines | mentions
   confidence REAL NOT NULL,
   resolution_method TEXT NOT NULL,  -- exact_alias, normalized_alias, embedding, llm_validation, manual
   created_at TEXT NOT NULL,
@@ -449,19 +572,19 @@ The previous `relations` phase is removed. Concept extraction replaces it as the
 
 ### 3.7 Concept extraction pipeline
 
-For each unit with metadata, extract raw concept mentions from metadata fields (defines, references, requires, exceptions, modifies, modified_by, overrides, related_to, incompatible_with, creates, consumes, supersedes, example_of, part_of, aliases). Each mention preserves the raw term, the unit it appeared in, and the mention type.
+For each unit with metadata, extract raw concept mentions from metadata fields. The metadata schema is simplified to two relationship fields:
+- `defines`: terms/mechanics/concepts that this unit DEFINES (primary definition or explanation)
+- `mentions`: terms/mechanics/concepts that this unit references, requires, modifies, or otherwise relates to
+
+Each mention preserves the raw term, the unit it appeared in, and the mention type (`defines` or `mentions`).
 
 ### 3.8 Concept type assignment
 
-Each concept has a generic `type` from this set:
-
+**Concepts do not have types.** The concept embedding document is built from:
 ```text
-mechanic, condition, attribute, resource, action, effect, item, characteristic, other
+Name + Aliases + Description
 ```
-
-When a new concept is created, its type is assigned by an LLM call that receives the raw term, the unit content where it was first mentioned, and the metadata field it came from. The LLM picks the most appropriate generic category. Avoid hard-coded domain vocabulary beyond these categories.
-
-When a mention resolves to an existing concept, the concept's existing type is used as a matching signal — a mention whose inferred type matches the candidate concept's type ranks higher. Type is not an absolute constraint because extraction can occasionally classify a mention incorrectly.
+No type field, no type assignment LLM call, no type validation in resolution. This simplifies the pipeline and avoids hard-coded domain vocabulary.
 
 ### 3.9 Concept normalization (resolution pipeline)
 
@@ -472,11 +595,11 @@ deterministic normalization (lowercase, whitespace, Unicode, hyphenation, lemmat
     ↓
 exact alias lookup (concept_aliases table, normalized_alias match)
     ↓ [if no match]
-concept embedding search (top 5-10 from concept Vectorize index)
+concept embedding search (top 5 from concept Vectorize index, lowered threshold ~0.55)
     ↓
-contextual + type validation (compare mention type with candidate concept type)
-    ↓ [if ambiguous]
-LLM validation (only for medium-similarity ambiguous matches)
+rerank candidates by vector similarity score
+    ↓
+LLM validation (for each candidate, until one matches)
     ↓
 existing concept OR new concept
 ```
@@ -497,21 +620,23 @@ existing concept OR new concept
 
 ### 3.10 Concept description generation
 
-After all concepts are resolved and merged:
+Concept descriptions are generated and regenerated **incrementally** during the concepts phase, not as a post-pass:
 
-1. For each concept, collect the most informative associated units:
-   - Units that `define` the concept
-   - Units that introduce or explain it
-   - Units describing its mechanics
-   - Units that modify or constrain it
-   - Important exceptions
-   - A few representative examples
+1. When a new concept is created, its description is generated from the creating unit's context (summary or content).
 
-2. Give these units to an LLM and ask it to produce a short (1-3 sentence) canonical, self-contained description.
+2. When a new `defines` mention resolves to an existing concept, the description is **regenerated immediately** using context from ALL units that define that concept so far (including the new one). This ensures the description reflects the most complete picture available at each point in the ingestion, improving vector search matching for subsequent units.
 
-3. Store `source_unit_ids` (which units were used) so the description can be regenerated when those units change.
+3. The description is built from aggregated context of all defining units:
+   - Each defining unit's name + summary (or content excerpt)
+   - Contexts are joined and given to an LLM to produce a 1-3 sentence canonical, self-contained description
 
-4. The description is a **retrieval representation**, not authoritative evidence. The actual semantic units remain the source of truth for answering questions.
+4. Store `source_unit_ids` (which units were used) so the description can be regenerated when those units change.
+
+5. The concept is re-embedded after each description regeneration (and after each new alias addition), so the concept Vectorize index always reflects the latest description + aliases.
+
+6. The description is a **retrieval representation**, not authoritative evidence. The actual semantic units remain the source of truth for answering questions.
+
+**Priority**: `defines` mentions take priority over `mentions` for description generation. A unit that merely mentions a concept does not trigger description regeneration — only units that define the concept do.
 
 ### 3.11 Concept embedding
 
@@ -528,11 +653,10 @@ Built from:
 ```text
 Canonical name
 Aliases
-Type
 Description
 ```
 
-Do not include all units mentioning the concept.
+Do not include all units mentioning the concept. No type field (concepts are untyped).
 
 ### 3.12 Debug viewer integration
 
@@ -543,7 +667,7 @@ The debug tree viewer (`pages/debug/index.html`) and its API endpoints (`/debug/
 The current side panel (`/debug/unit/:id` → `getUnitDetails` in `db.ts`) shows "Relations (Outgoing)" and "Relations (Incoming)" sections. Replace these with a "Concepts" section showing:
 - Concept canonical name (clickable → opens concept detail view)
 - Concept type
-- Mention type (defines, references, requires, etc.)
+- Mention type (defines, mentions)
 - Resolution method (exact_alias, embedding, llm_validation, etc.)
 - Confidence
 
@@ -551,12 +675,11 @@ The current side panel (`/debug/unit/:id` → `getUnitDetails` in `db.ts`) shows
 
 Add a concept list panel to the debug viewer (similar to the source node dropdown). Shows all concepts for the document with:
 - Canonical name
-- Type
 - Alias count
 - Mention count
 
 Clicking a concept opens a concept detail side panel showing:
-- Canonical name, type, description
+- Canonical name, description
 - All aliases (with language and source)
 - All mentions (unit ID, raw term, mention type, resolution method, confidence)
 - Source unit IDs used for description generation
@@ -933,9 +1056,9 @@ Rationale: direct retrieval candidates matched the query semantically or lexical
 
 **5. Preserve complementary rules**
 
-After the initial selection, check the metadata of selected evidence units. If a selected unit has metadata fields that reference other units (e.g. `requires`, `exceptions`, `modifies`), check whether the referenced units are in the candidate pool. If a referenced unit is in the pool but wasn't selected (because its score was below other candidates), add it to the evidence set — up to the budget — because it provides complementary information needed to interpret the selected unit.
+After the initial selection, check the metadata of selected evidence units. If a selected unit has metadata fields that reference other units (via `mentions`), check whether the referenced units are in the candidate pool. If a referenced unit is in the pool but wasn't selected (because its score was below other candidates), add it to the evidence set — up to the budget — because it provides complementary information needed to interpret the selected unit.
 
-Specifically, for each selected unit, look at its `metadata.requires`, `metadata.exceptions`, `metadata.modifies`, and `metadata.modified_by` fields. For each referenced term, check if any candidate unit's name or aliases match. If a matching candidate exists and isn't already selected, add it.
+Specifically, for each selected unit, look at its `metadata.mentions` field. For each referenced term, check if any candidate unit's name or aliases match. If a matching candidate exists and isn't already selected, add it.
 
 This prevents the situation where the answer model gets a rule about "Stunned" but not the exception that says "immunity to stun for 1 round after recovering," even though the exception was in the candidate pool with a slightly lower score.
 
@@ -1333,7 +1456,7 @@ FTS5 index update → semantic_unit_search
 Concept extraction
     ├──→ concept mentions (raw terms from metadata)
     ├──→ concept normalization (alias lookup → embedding search → LLM validation)
-    ├──→ concept descriptions (LLM-generated from associated units)
+    ├──→ concept descriptions (LLM-generated from defining units, regenerated on new defines)
     ├──→ concept embeddings → VECTORIZE_CONCEPTS_IDX
     └──→ concept_aliases (reactive, accumulated as mentions resolve)
     │

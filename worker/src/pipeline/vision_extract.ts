@@ -30,10 +30,12 @@ const SYSTEM_PROMPT: string = INGESTION.vision.prompt.text;
 
 /**
  * Generate a UUID-based ID for a vision unit.
- * Format: RULE-<uuid> or TABLE-<uuid>, depending on the unit type.
+ * Format: RULE-<uuid>, TABLE-<uuid>, or IMG-<uuid>, depending on the unit type.
  */
 function unitId(type: string): string {
-  const prefix = type === "Table" ? "TABLE" : "RULE";
+  const prefix = type === "Image" ? "IMG"
+    : (type === "DataTableHeader" || type === "DataTableRow" || type === "ColumnListTable" || type === "ColumnListItem") ? "TABLE"
+    : "RULE";
   return nextId(prefix);
 }
 

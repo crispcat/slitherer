@@ -1,35 +1,40 @@
-# AI Rulebook Knowledge Engine — MVP
+# AI Rulebook Knowledge Engine
 
-Implements the MVP deliverables from [IMPLEMENTATION.md](IMPLEMENTATION.md) for the
+Implements the architecture from [IMPROVEMENT.md](IMPROVEMENT.md) for the
 `rulebooks/deorim_rules.pdf` rulebook.
 
 ## Architecture
 
-- **`worker/`** (TypeScript, Cloudflare Workers) — Phases 1-5: vision extraction
-  (page images → semantic units via vision-language model), summary + embeddings,
-  metadata extraction (LLM), relationship extraction (vector search + deterministic
-  hierarchy). Phases 6-8: agentic retrieval (router → decompose → retrieve →
-  sufficiency loop → answer), citation-aware answer generation. Uses Workers AI
-  (`AI` binding), Vectorize, D1, R2, and Queues.
+- **`worker/`** (TypeScript, Cloudflare Workers) — Ingestion: vision extraction
+  (page images → semantic units via vision-language model), summary, subject +
+  content embeddings, metadata extraction (LLM), concept extraction + resolution.
+  Retrieval: hybrid (subject + content Vectorize + FTS5 lexical, RRF-fused),
+  concept-first + type-driven structural expansion, reranking, evidence selection,
+  sufficiency loop, citation-aware answer generation. Uses Workers AI (`AI`
+  binding), Vectorize (3 indexes), D1, R2, and Queues.
 - **`pages/client/`** (HTML/CSS/JS, Worker static assets) — GPT-like chat UI for the
   retrieval API. Supports both full (all-in-one) and staged (step-by-step)
   request modes, SSE token streaming, expandable intermediate thinking
   steps, and parameter controls for all API options.
 - **`pages/debug/`** (HTML/CSS/JS, D3.js, Worker static assets) — Debug tree viewer
-  for inspecting the semantic unit hierarchy, metadata, and relations.
+  for inspecting the semantic unit hierarchy, metadata, concepts, concept
+  mentions, retrieval candidate logs, and debug logs.
 - **`config/`** (YAML) — Externalized configuration for all pipeline values,
-  prompts, model references, and thresholds. Read at build time by
-  `gen-config.mjs` to generate `worker/src/config.gen.ts`.
+  prompts, and thresholds. Read at build time by `gen-config.mjs` to generate
+  `worker/src/config.gen.ts`. Model bindings live in `worker/wrangler.toml`.
 
-## Known MVP limitations
+## Known limitations
 
-- Ingestion runs as four sequential phases (vision → summary → metadata →
-  relations), each only starting once the previous phase has processed every
-  unit. The vision phase is Queue-driven (one page at a time, max_concurrency=1);
-  post-vision phases are advanced via `POST /ingest/step` in batches.
+- Ingestion runs as sequential phases (vision → summary → metadata →
+  embeddings → concepts), each only starting once the previous phase has
+  processed every unit. The vision phase is Queue-driven (one page at a time,
+  max_concurrency=1); post-vision phases are advanced via `POST /ingest/step`
+  in batches.
 - Ingestion is chunked into batches to stay within a single Worker invocation's
   CPU budget — a ~200 page book requires many step calls (LLM call per unit
-  × 2-3 pipeline phases).
+  × multiple pipeline phases).
+- v1 is single-document retrieval. The `document_id` field is in the schema
+  for future multi-document support, but retrieval does not filter by document.
 
 ## 1. Install system dependencies
 
@@ -51,7 +56,9 @@ Requires a Cloudflare account and `wrangler login`.
 cd worker
 npm install
 npx wrangler d1 create slitherer-rag-db          # copy the database_id into wrangler.toml
-npx wrangler vectorize create slitherer-rag-units --dimensions=1024 --metric=cosine
+npx wrangler vectorize create slitherer-rag-subjects --dimensions=1024 --metric=cosine
+npx wrangler vectorize create slitherer-rag-content --dimensions=1024 --metric=cosine
+npx wrangler vectorize create slitherer-rag-concepts-idx --dimensions=1024 --metric=cosine
 npx wrangler r2 bucket create slitherer-rag-storage
 npx wrangler queues create vision-ingest          # Queue for vision pipeline
 npm run db:migrate:remote                         # applies schema.sql
@@ -96,12 +103,12 @@ config files in `config/` and generates `worker/src/config.gen.ts`. See the
 
 Use `npm run ingest` to drive the vision-based ingestion pipeline. The script:
 
-1. Renders PDF pages to PNG images (via PyMuPDF, 200 DPI)
+1. Renders PDF pages to PNG images (via `pdftoppm`, 200 DPI)
 2. Uploads page images to R2 (`pages/{documentId}/{page}.png`) via `PUT /ingest/r2/{key}`
    — unchanged images are skipped via hash check
 3. Calls `POST /ingest` to enqueue all pages to the vision Queue
 4. Polls `GET /ingest/status` until the vision phase completes
-5. Drives post-vision phases (summary → metadata → relations) via `POST /ingest/step`
+5. Drives post-vision phases (summary → metadata → embeddings → concepts) via `POST /ingest/step`
 
 It tracks stage/progress, persists a resumable state file (`.ingest-state.json`),
 and retries transient errors with backoff while logging to `ingest.log`.
@@ -137,8 +144,7 @@ re-run the same command — it resumes from the exact job/phase recorded in
 `.ingest-state.json` instead of restarting. Use `--fresh` to force a brand
 new job, or `--status-only` to just print the current job status.
 
-Other useful flags: `--skip-parse` (skip parsing, use existing output),
-`--skip-upload` (skip uploading to R2), `--max-retries <n>` (default 5),
+Other useful flags: `--max-retries <n>` (default 5),
 `--poll-delay-ms <n>` (default 1000), `--pages <ranges>` (only ingest specific
 pages, e.g. `--pages 5-10` or `--pages 1,3,5-10`).
 
@@ -157,8 +163,6 @@ cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --pages 7
 
 The page range syntax supports comma-separated ranges: `5-10` (pages 5
 through 10), `1,3,5-10` (pages 1, 3, and 5 through 10), `7` (just page 7).
-Post-vision stages (summary, metadata, relations) always process all units
-in the database regardless of the `--pages` filter.
 
 ### Run a single ingestion stage
 
@@ -172,7 +176,8 @@ thresholds without redoing the entire pipeline.
 cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --stage vision     # re-run vision extraction (resets + re-enqueues pages)
 cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --stage summary    # re-generate summaries + embeddings
 cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --stage metadata   # re-extract metadata
-cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --stage relations  # re-extract relations
+cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --stage embedding  # re-generate subject + content embeddings
+cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --stage concepts   # re-extract concepts + mentions
 ```
 
 `--stage vision` resets the vision phase and re-enqueues all existing page
@@ -181,11 +186,38 @@ images to the vision Queue (it does NOT re-parse or re-upload — use a full
 state file and require a prior run. The worker skips ahead to the requested
 phase and stops after it completes.
 
-**What gets cleared per stage:**
-- `vision`: semantic_units, embeddings, relations; resets job to vision phase and re-enqueues pages
-- `summary`: summaries, embeddings, metadata, relations; resets status to `pending`
-- `metadata`: metadata, relations; resets status to `summary_done`
-- `relations`: relations only; resets status to `metadata_done`
+### Page-scoped stage resets
+
+`--pages` can be combined with `--stage` to reset and re-run only the units
+on specific pages, without affecting the rest of the document:
+
+```bash
+cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --stage vision --pages 7-10    # re-extract vision for pages 7-10 only
+cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --stage summary --pages 7-10   # re-generate summaries for pages 7-10's units
+cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --stage metadata --pages 7-10  # re-extract metadata for pages 7-10's units
+cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --stage embedding --pages 7-10 # re-generate embeddings for pages 7-10's units
+cd worker && npm run ingest -- --input ../rulebooks/deorim_rules.pdf --stage concepts --pages 7-10  # re-extract concepts for pages 7-10's units
+```
+
+Without `--pages`, the stage reset is document-wide (all units). With
+`--pages`, only units on the specified pages are reset and re-processed.
+For concepts, page-scoped resets only clear mentions for the affected units'
+pages and delete orphaned concepts (concepts with no remaining mentions from
+any unit). Non-orphaned concepts are preserved and updated via re-resolution.
+
+**What gets cleared per stage (document-wide):**
+- `vision`: semantic_units, embeddings, concepts; resets job to vision phase and re-enqueues pages
+- `summary`: summaries, embeddings, metadata, concepts; resets status to `pending`
+- `metadata`: metadata, embeddings, concepts; resets status to `summary_done`
+- `embedding`: subject + content embeddings, concepts; resets status to `metadata_done`
+- `concepts`: concepts + mentions only; resets status to `embedding_done`
+
+**What gets cleared per stage (page-scoped with `--pages`):**
+- `vision`: units + vectors + concept mentions for the specified pages only; re-enqueues only those pages
+- `summary`: summaries + downstream for units on the specified pages; resets their status to `pending`
+- `metadata`: metadata + embeddings + concept mentions for units on the specified pages; resets their status to `summary_done`
+- `embedding`: subject + content vectors for units on the specified pages; resets their status to `metadata_done`
+- `concepts`: concept mentions for units on the specified pages + orphaned concepts; resets their status to `embedding_done`
 
 ### Clear all ingestion data
 
@@ -196,10 +228,11 @@ parsing or redeploying:
 cd worker && npm run clear
 ```
 
-This clears D1 tables, Vectorize vectors, and R2 job/structure files for the
-document, plus local state files. It preserves R2 page images (reused on the
-next ingest — the ingest script skips re-uploading unchanged files via hash
-check). It preserves client logs (conversations, query_logs).
+This clears D1 tables, Vectorize vectors (subjects + content + concepts), and
+R2 job/structure files for the document, plus local state files. It preserves
+R2 page images (reused on the next ingest — the ingest script skips
+re-uploading unchanged files via hash check). It preserves client logs
+(conversations, query_logs, debug_logs, candidate_logs).
 
 ## 5. Query
 
@@ -220,13 +253,15 @@ each ingestion is a full re-run of all phases.
 
 ## Configuration
 
-All hardcoded values, prompts, model references, and thresholds are
-externalized into YAML files under `config/`:
+All hardcoded values, prompts, and thresholds are externalized into YAML
+files under `config/`:
 
 - `config/ingestion.yaml` — pipeline thresholds, batch sizes, LLM temperatures, all ingestion prompts
-- `config/retrieval.yaml` — retrieval thresholds, graph hops, all retrieval prompts
+- `config/retrieval.yaml` — retrieval thresholds, ranking weights, all retrieval prompts
 - `config/pages.yaml` — client/debug site URLs, UI feature flags
 - `config/worker.yaml` — worker URL, CORS headers
+
+Model bindings are configured in `worker/wrangler.toml` (not in YAML).
 
 A build-time codegen script (`worker/scripts/gen-config.mjs`) reads the YAML
 and generates `worker/src/config.gen.ts` (gitignored), which is imported by
