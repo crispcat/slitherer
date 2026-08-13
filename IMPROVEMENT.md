@@ -358,12 +358,19 @@ Update the extraction rules in the prompt:
 
 ### 3.3 Deterministic type-checking rules
 
-After vision extraction, apply deterministic checks to enforce type consistency:
+After vision extraction, apply deterministic checks to enforce type consistency. **The parent's type takes precedence** — the parent defines the table structure, children conform to it. This avoids conflicts where the vision model assigns contradictory types to a parent and child.
 
-1. **If a unit is `DataTableHeader`** → all its children must be `DataTableRow`. If any child has a different type, reclassify it to `DataTableRow`.
-2. **If a unit is `ColumnListTable`** → all its children must be `ColumnListItem`. If any child has a different type, reclassify it to `ColumnListItem`.
-3. **If a unit is `DataTableRow`** → its parent must be `DataTableHeader`. If the parent has a different type, reclassify the parent to `DataTableHeader`.
-4. **If a unit is `ColumnListItem`** → its parent must be `ColumnListTable`. If the parent has a different type, reclassify the parent to `ColumnListTable`.
+**Pass 1 — parent → children (parent wins):**
+
+1. **If a unit is `DataTableHeader`** → all its children must be `DataTableRow`. Reclassify any child with a different type to `DataTableRow`.
+2. **If a unit is `ColumnListTable`** → all its children must be `ColumnListItem`. Reclassify any child with a different type to `ColumnListItem`.
+
+**Pass 2 — child → parent (only when parent is not already a table type):**
+
+3. **If a unit is `DataTableRow`** and its parent is NOT already `DataTableHeader` or `ColumnListTable` → reclassify the parent to `DataTableHeader`.
+4. **If a unit is `ColumnListItem`** and its parent is NOT already `DataTableHeader` or `ColumnListTable` → reclassify the parent to `ColumnListTable`.
+
+Pass 2 only fires when the parent has a non-table type (e.g. `Rule`). If the parent is already a table type (from pass 1 or from the vision model), pass 1 already resolved the children, so pass 2 is skipped. This prevents the oscillation where rule 3 reclassifies a `ColumnListTable` parent to `DataTableHeader` while rule 2 reclassifies the `DataTableRow` child to `ColumnListItem`.
 
 These checks run after vision extraction and before the summary phase, as part of the unit validation step in `worker/src/pipeline/units.ts`.
 
